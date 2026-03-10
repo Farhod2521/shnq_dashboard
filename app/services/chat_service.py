@@ -805,10 +805,38 @@ def _can_answer_with_relaxed_threshold(items: list[RetrievalItem], best_score: f
     return ratio >= settings.RAG_DOC_DOMINANCE_MIN_RATIO and top_keyword >= settings.RAG_STRONG_KEYWORD_MIN
 
 
-def _build_document_clarification_answer(docs: list[str]) -> str:
+def _get_document_titles_by_code(db: Session, docs: list[str]) -> dict[str, str]:
+    normalized_docs = [code.strip() for code in docs if code and code.strip()]
+    if not normalized_docs:
+        return {}
+
+    rows = db.query(Document.code, Document.title).filter(Document.code.in_(normalized_docs)).all()
+    title_by_code: dict[str, str] = {}
+    for row in rows:
+        code = (row.code or "").strip()
+        title = " ".join((row.title or "").split())
+        if not code or not title:
+            continue
+        key = code.lower()
+        if key not in title_by_code:
+            title_by_code[key] = title
+    return title_by_code
+
+
+def _build_document_clarification_answer(docs: list[str], title_by_code: dict[str, str] | None = None) -> str:
+    lines = []
+    mapping = title_by_code or {}
+    for code in docs:
+        title = mapping.get(code.lower())
+        if title:
+            lines.append(f"- {code} {title}")
+        else:
+            lines.append(f"- {code}")
+
     return (
         "Savolda bir nechta hujjatda mos variant topildi. "
-        f"Aniq javob uchun qaysi hujjat kerakligini tanlang: {', '.join(docs)}."
+        "Aniq javob uchun qaysi hujjat kerakligini tanlang:\n"
+        + "\n".join(lines)
     )
 
 
@@ -1186,6 +1214,7 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     if not requested_doc_code:
         ask_doc, docs = _should_ask_document_clarification(clause_items, best_score)
         if ask_doc:
+            title_by_code = _get_document_titles_by_code(db, docs)
             meta = {
                 "type": "clarification",
                 "missing_case": "ambiguous_document",
@@ -1194,7 +1223,13 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                 "query_language": detected_language,
             }
             _attach_timing_meta(meta, timings, started_at)
-            return {"answer": _build_document_clarification_answer(docs), "sources": [], "table_html": None, "image_urls": [], "meta": meta}
+            return {
+                "answer": _build_document_clarification_answer(docs, title_by_code),
+                "sources": [],
+                "table_html": None,
+                "image_urls": [],
+                "meta": meta,
+            }
 
     relaxed = _can_answer_with_relaxed_threshold(clause_items, best_score)
     if best_score < settings.RAG_STRICT_MIN_SCORE and not (relaxed or row_items or image_items):
