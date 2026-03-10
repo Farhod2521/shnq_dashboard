@@ -201,6 +201,37 @@ def _extract_table_number(text: str) -> str | None:
     return (match.group(1) or match.group(2) or "").strip().replace(",", ".")
 
 
+def _normalize_table_reference(value: str | None) -> str:
+    return re.sub(r"[\s,\-]+", ".", (value or "").strip().lower()).strip(".")
+
+
+def _table_reference_variants(table_number: str) -> list[str]:
+    normalized = _normalize_table_reference(table_number)
+    if not normalized:
+        return []
+    variants = [
+        normalized,
+        normalized.replace(".", "-"),
+        normalized.replace(".", ","),
+        normalized.replace(".", ""),
+    ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in variants:
+        key = item.lower()
+        if not item or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _match_table_number(value: str | None, target: str) -> bool:
+    source = _normalize_table_reference(value)
+    wanted = _normalize_table_reference(target)
+    return bool(source and wanted and source == wanted)
+
+
 def _extract_appendix_number(text: str) -> str | None:
     match = APPENDIX_NUMBER_RE.search(_normalize_text(text))
     if not match:
@@ -234,6 +265,53 @@ def _build_table_answer(table: NormTable) -> str:
     return f"{table.document.code if table.document else ''} bo'yicha {table.table_number} topildi ({chapter_title})."
 
 
+def _find_tables_by_reference(
+    db: Session,
+    table_number: str,
+    doc_code: str | None = None,
+) -> list[NormTable]:
+    variants = _table_reference_variants(table_number)
+    if not variants:
+        return []
+
+    query = db.query(NormTable).options(joinedload(NormTable.document), joinedload(NormTable.chapter))
+    filters = [NormTable.table_number.ilike(variant) for variant in variants]
+    for variant in variants:
+        filters.extend(
+            [
+                NormTable.title.ilike(f"%{variant}%"),
+                NormTable.markdown.ilike(f"%{variant}%"),
+                NormTable.raw_html.ilike(f"%{variant}%"),
+            ]
+        )
+
+    candidates = query.filter(or_(*filters)).all()
+    candidates = [
+        item
+        for item in candidates
+        if _match_table_number(item.table_number, table_number)
+        or any(
+            variant.lower() in (item.title or "").lower()
+            or variant.lower() in (item.markdown or "").lower()
+            or variant.lower() in (item.raw_html or "").lower()
+            for variant in variants
+        )
+    ]
+    if doc_code:
+        key = re.sub(r"\s+", "", doc_code).lower()
+        candidates = [c for c in candidates if c.document and key in re.sub(r"\s+", "", c.document.code).lower()]
+
+    unique: list[NormTable] = []
+    seen_ids: set[str] = set()
+    for item in candidates:
+        item_id = str(item.id)
+        if item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+        unique.append(item)
+    return unique
+
+
 def _find_table_for_query(
     db: Session,
     message: str,
@@ -246,13 +324,7 @@ def _find_table_for_query(
     doc_code = doc_code_hint or _extract_doc_code(message)
     if not table_number:
         return None, table_number, doc_code, []
-
-    query = db.query(NormTable).options(joinedload(NormTable.document), joinedload(NormTable.chapter))
-    query = query.filter(NormTable.table_number.ilike(table_number))
-    candidates = query.all()
-    if doc_code:
-        key = re.sub(r"\s+", "", doc_code).lower()
-        candidates = [c for c in candidates if c.document and key in re.sub(r"\s+", "", c.document.code).lower()]
+    candidates = _find_tables_by_reference(db, table_number, doc_code)
     if not candidates:
         return None, table_number, doc_code, []
     if len(candidates) == 1:
@@ -261,15 +333,19 @@ def _find_table_for_query(
 
 
 def _table_candidate_docs(db: Session, table_number: str) -> list[str]:
-    rows = (
-        db.query(Document.code)
-        .join(NormTable, NormTable.document_id == Document.id)
-        .filter(NormTable.table_number.ilike(table_number))
-        .distinct()
-        .limit(7)
-        .all()
-    )
-    return [code for (code,) in rows if code]
+    rows = _find_tables_by_reference(db, table_number)
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        code = row.document.code if row.document else ""
+        key = code.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(code)
+        if len(out) >= 7:
+            break
+    return out
 
 
 def _table_candidate_chapters(candidates: list[NormTable]) -> list[str]:
