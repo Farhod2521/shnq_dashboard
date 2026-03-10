@@ -1,4 +1,5 @@
 import os
+import threading
 import uuid
 from datetime import datetime
 
@@ -8,6 +9,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.dependency import get_db
+from app.db.session import SessionLocal
 from app.models.category import Category
 from app.models.clause import Clause
 from app.models.clause_embedding import ClauseEmbedding
@@ -82,6 +84,12 @@ class DocumentCreateResponse(BaseModel):
     id: str
     code: str
     status: str
+
+
+class DocumentRequeueResponse(BaseModel):
+    detail: str
+    queuedCount: int
+    documentIds: list[str]
 
 
 class DeleteResponse(BaseModel):
@@ -278,6 +286,67 @@ def _set_process_queued(db: Session, document_id: uuid.UUID):
     process.finished_at = None
     process.updated_at = datetime.utcnow()
     db.add(process)
+
+
+def _run_pipeline_batch(document_ids: list[str]):
+    for document_id in document_ids:
+        try:
+            run_document_pipeline(document_id)
+        except Exception:
+            # Individual pipeline xatoligi DocumentProcess status=failed ga tushadi.
+            continue
+
+
+def _collect_requeue_targets(
+    db: Session,
+    *,
+    include_failed: bool = False,
+    limit: int = 500,
+) -> list[DocumentProcess]:
+    statuses = ["queued", "processing"]
+    if include_failed:
+        statuses.append("failed")
+    return (
+        db.query(DocumentProcess)
+        .filter(DocumentProcess.status.in_(statuses))
+        .order_by(DocumentProcess.updated_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+
+def _requeue_process_rows(db: Session, process_rows: list[DocumentProcess]) -> list[str]:
+    if not process_rows:
+        return []
+    for row in process_rows:
+        _set_process_queued(db, row.document_id)
+    db.commit()
+    return [str(row.document_id) for row in process_rows]
+
+
+def resume_document_pipelines_on_startup(*, include_failed: bool = False, limit: int = 500) -> int:
+    db = SessionLocal()
+    try:
+        process_rows = _collect_requeue_targets(
+            db,
+            include_failed=include_failed,
+            limit=limit,
+        )
+        document_ids = _requeue_process_rows(db, process_rows)
+    finally:
+        db.close()
+
+    if not document_ids:
+        return 0
+
+    worker = threading.Thread(
+        target=_run_pipeline_batch,
+        args=(document_ids,),
+        daemon=True,
+        name="document-pipeline-recovery",
+    )
+    worker.start()
+    return len(document_ids)
 
 
 def _to_list_item(document: Document, process: DocumentProcess | None) -> DocumentListItem:
@@ -600,6 +669,34 @@ def update_document(
         background_tasks.add_task(run_document_pipeline, str(doc.id))
 
     return DocumentCreateResponse(id=str(doc.id), code=doc.code, status=status)
+
+
+@router.post("/documents/requeue-stuck", response_model=DocumentRequeueResponse)
+def requeue_stuck_documents(
+    background_tasks: BackgroundTasks,
+    include_failed: bool = Query(default=False),
+    limit: int = Query(default=500, ge=1, le=5000),
+    db: Session = Depends(get_db),
+):
+    process_rows = _collect_requeue_targets(
+        db,
+        include_failed=include_failed,
+        limit=limit,
+    )
+    document_ids = _requeue_process_rows(db, process_rows)
+    if not document_ids:
+        return DocumentRequeueResponse(
+            detail="Qayta navbatga qo'yiladigan hujjat topilmadi.",
+            queuedCount=0,
+            documentIds=[],
+        )
+
+    background_tasks.add_task(_run_pipeline_batch, document_ids)
+    return DocumentRequeueResponse(
+        detail="Hujjatlar qayta navbatga qo'yildi va pipeline ishga tushirildi.",
+        queuedCount=len(document_ids),
+        documentIds=document_ids,
+    )
 
 
 @router.delete("/documents/{document_id}", response_model=DeleteResponse)

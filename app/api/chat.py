@@ -1,4 +1,5 @@
 from datetime import datetime
+import re
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -14,6 +15,8 @@ from app.services.chat_service import answer_message
 
 
 router = APIRouter()
+DOCUMENT_CODE_RE = re.compile(r"\b(shnq|qmq|kmk|snip)\s*([0-9][0-9.\-]*)\b", re.IGNORECASE)
+AMBIGUOUS_DOCUMENT_PROMPT = "savolda bir nechta hujjatda mos variant topildi"
 
 
 class ChatPingRequest(BaseModel):
@@ -101,6 +104,103 @@ def _short_title(message: str) -> str:
     if len(compact) <= 80:
         return compact
     return f"{compact[:77]}..."
+
+
+def _extract_document_codes(text: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in DOCUMENT_CODE_RE.finditer(" ".join((text or "").split())):
+        code = f"{match.group(1).upper()} {match.group(2)}"
+        key = code.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(code)
+    return out
+
+
+def _normalize_document_code(value: str | None) -> str | None:
+    if not value:
+        return None
+    codes = _extract_document_codes(value)
+    if codes:
+        return codes[0]
+    compact = " ".join(value.split())
+    return compact or None
+
+
+def _looks_like_document_selection(message: str) -> bool:
+    text = " ".join((message or "").strip().split())
+    if not text:
+        return False
+    if not _extract_document_codes(text):
+        return False
+    token_count = len(text.split())
+    if token_count <= 8:
+        return True
+    lowered = text.lower()
+    selection_markers = ("shu", "tanla", "tanladim", "kerak", "mana")
+    return token_count <= 14 and any(marker in lowered for marker in selection_markers)
+
+
+def _resolve_followup_document_request(
+    db: Session,
+    session: ChatSession | None,
+    user_message: str,
+    document_code: str | None,
+) -> tuple[str, str | None, dict | None]:
+    effective_message = user_message
+    effective_document_code = _normalize_document_code(document_code)
+
+    if not session:
+        return effective_message, effective_document_code, None
+
+    selected_from_message = _normalize_document_code(user_message)
+    selected_code = effective_document_code or selected_from_message
+    if not selected_code:
+        return effective_message, effective_document_code, None
+    compact_user_message = " ".join((user_message or "").strip().split())
+    short_document_reply = bool(effective_document_code) and len(compact_user_message.split()) <= 6
+    if not _looks_like_document_selection(user_message) and not short_document_reply:
+        return effective_message, effective_document_code, None
+
+    last_assistant = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.session_id == session.id, ChatMessage.role == "assistant")
+        .order_by(ChatMessage.created_at.desc())
+        .first()
+    )
+    if not last_assistant:
+        return effective_message, effective_document_code, None
+    if AMBIGUOUS_DOCUMENT_PROMPT not in (last_assistant.content or "").lower():
+        return effective_message, effective_document_code, None
+
+    candidate_codes = _extract_document_codes(last_assistant.content or "")
+    if candidate_codes and selected_code.lower() not in {code.lower() for code in candidate_codes}:
+        return effective_message, effective_document_code, None
+
+    previous_user = (
+        db.query(ChatMessage)
+        .filter(
+            ChatMessage.session_id == session.id,
+            ChatMessage.role == "user",
+            ChatMessage.created_at < last_assistant.created_at,
+        )
+        .order_by(ChatMessage.created_at.desc())
+        .first()
+    )
+    if not previous_user or not (previous_user.content or "").strip():
+        return effective_message, effective_document_code, None
+
+    return (
+        previous_user.content.strip(),
+        selected_code,
+        {
+            "followup_mode": "document_selection",
+            "followup_selected_document": selected_code,
+            "followup_original_question": previous_user.content.strip(),
+        },
+    )
 
 
 def _to_session_response(session: ChatSession) -> ChatSessionResponse:
@@ -328,11 +428,22 @@ def chat_message(
                 db.commit()
                 db.refresh(session)
 
-        result = answer_message(
+        effective_message, effective_document_code, followup_meta = _resolve_followup_document_request(
             db=db,
-            message=payload.message,
+            session=session,
+            user_message=payload.message,
             document_code=payload.document_code,
         )
+
+        result = answer_message(
+            db=db,
+            message=effective_message,
+            document_code=effective_document_code,
+        )
+        if followup_meta:
+            if not isinstance(result.get("meta"), dict):
+                result["meta"] = {}
+            result["meta"].update(followup_meta)
 
         assistant_text = _extract_answer_text(result)
         if not session.title:
