@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.db.dependency import get_db
 from app.db.session import SessionLocal
 from app.models.category import Category
+from app.models.chapter import Chapter
 from app.models.clause import Clause
 from app.models.clause_embedding import ClauseEmbedding
 from app.models.document import Document
@@ -20,6 +21,7 @@ from app.models.document_process import DocumentProcess
 from app.models.image_embedding import ImageEmbedding
 from app.models.norm_image import NormImage
 from app.models.norm_table import NormTable
+from app.models.norm_table_cell import NormTableCell
 from app.models.norm_table_row import NormTableRow
 from app.models.section import Section
 from app.models.table_row_embedding import TableRowEmbedding
@@ -348,6 +350,32 @@ def _requeue_process_rows(db: Session, process_rows: list[DocumentProcess]) -> l
         _set_process_queued(db, row.document_id)
     db.commit()
     return [str(row.document_id) for row in process_rows]
+
+
+def _purge_document_relations(db: Session, document_id: uuid.UUID):
+    clause_ids = [row[0] for row in db.query(Clause.id).filter(Clause.document_id == document_id).all()]
+    table_ids = [row[0] for row in db.query(NormTable.id).filter(NormTable.document_id == document_id).all()]
+    image_ids = [row[0] for row in db.query(NormImage.id).filter(NormImage.document_id == document_id).all()]
+    row_ids: list[uuid.UUID] = []
+    if table_ids:
+        row_ids = [row[0] for row in db.query(NormTableRow.id).filter(NormTableRow.table_id.in_(table_ids)).all()]
+
+    if clause_ids:
+        db.query(ClauseEmbedding).filter(ClauseEmbedding.clause_id.in_(clause_ids)).delete(synchronize_session=False)
+    if row_ids:
+        db.query(TableRowEmbedding).filter(TableRowEmbedding.row_id.in_(row_ids)).delete(synchronize_session=False)
+        db.query(NormTableCell).filter(NormTableCell.row_id.in_(row_ids)).delete(synchronize_session=False)
+        db.query(NormTableRow).filter(NormTableRow.id.in_(row_ids)).delete(synchronize_session=False)
+    if image_ids:
+        db.query(ImageEmbedding).filter(ImageEmbedding.image_id.in_(image_ids)).delete(synchronize_session=False)
+        db.query(NormImage).filter(NormImage.id.in_(image_ids)).delete(synchronize_session=False)
+    if table_ids:
+        db.query(NormTable).filter(NormTable.id.in_(table_ids)).delete(synchronize_session=False)
+    if clause_ids:
+        db.query(Clause).filter(Clause.id.in_(clause_ids)).delete(synchronize_session=False)
+
+    db.query(Chapter).filter(Chapter.document_id == document_id).delete(synchronize_session=False)
+    db.query(DocumentProcess).filter(DocumentProcess.document_id == document_id).delete(synchronize_session=False)
 
 
 def resume_document_pipelines_on_startup(
@@ -742,6 +770,7 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
     original_path = doc.original_file
     html_path = doc.html_file
 
+    _purge_document_relations(db, parsed_id)
     db.delete(doc)
     db.commit()
 
