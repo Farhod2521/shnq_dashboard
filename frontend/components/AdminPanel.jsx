@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { categoriesSeed, documentsSeed, registrySeed } from "../lib/mockData";
@@ -384,7 +384,7 @@ export default function AdminPanel() {
             Theme: <strong>{theme}</strong>
           </p>
           <p>
-            NEXT_PUBLIC_API_URL: <strong>{process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}</strong>
+            NEXT_PUBLIC_API_URL: <strong>{process.env.NEXT_PUBLIC_API_URL || "https://shnq-api.dashboard.iqmath.uz"}</strong>
           </p>
           <p>
             Polling interval: <strong>{POLL_MS / 1000}s</strong>
@@ -394,3 +394,4 @@ export default function AdminPanel() {
     </main>
   );
 }
+

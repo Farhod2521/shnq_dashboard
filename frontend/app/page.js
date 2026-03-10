@@ -1,10 +1,15 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://shnq-api.dashboard.iqmath.uz";
+const AUTH_SESSION_KEY = "shnq_dashboard_static_auth";
+const STATIC_LOGIN = {
+  username: "tmsiti-1234",
+  password: "tmsiti_1234",
+};
 
 const STATUS_ORDER = {
   queued: 0,
@@ -1323,6 +1328,10 @@ export default function HomePage() {
   const [isLoadingDocs, setIsLoadingDocs] = useState(false);
   const [cornerMessage, setCornerMessage] = useState("");
   const [cornerType, setCornerType] = useState("success");
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [loginForm, setLoginForm] = useState({ username: "", password: "" });
+  const [loginError, setLoginError] = useState("");
   const pathname = usePathname();
   const isDashboardPage = pathname === "/";
   const isSectionsPage = pathname === "/sections";
@@ -1330,6 +1339,12 @@ export default function HomePage() {
   const isDocumentsPage = pathname === "/documents";
   const isUsersPage = pathname === "/users";
   const isQAPage = pathname === "/qa";
+
+  useEffect(() => {
+    const session = window.localStorage.getItem(AUTH_SESSION_KEY);
+    setIsAuthenticated(session === "ok");
+    setIsAuthReady(true);
+  }, []);
 
   useEffect(() => {
     const saved = window.localStorage.getItem("theme");
@@ -1345,6 +1360,40 @@ export default function HomePage() {
     document.documentElement.classList.remove("light", "dark");
     document.documentElement.classList.add(nextTheme);
     window.localStorage.setItem("theme", nextTheme);
+  }
+
+  function handleLoginFieldChange(event) {
+    const { name, value } = event.target;
+    setLoginForm((prev) => ({ ...prev, [name]: value }));
+    if (loginError) {
+      setLoginError("");
+    }
+  }
+
+  function handleLoginSubmit(event) {
+    event.preventDefault();
+    const enteredUsername = loginForm.username.trim();
+    const enteredPassword = loginForm.password;
+
+    if (
+      enteredUsername === STATIC_LOGIN.username &&
+      enteredPassword === STATIC_LOGIN.password
+    ) {
+      window.localStorage.setItem(AUTH_SESSION_KEY, "ok");
+      setIsAuthenticated(true);
+      setLoginError("");
+      setLoginForm({ username: "", password: "" });
+      return;
+    }
+
+    window.localStorage.removeItem(AUTH_SESSION_KEY);
+    setIsAuthenticated(false);
+    setLoginError("Login yoki parol noto'g'ri.");
+  }
+
+  function handleLogout() {
+    window.localStorage.removeItem(AUTH_SESSION_KEY);
+    setIsAuthenticated(false);
   }
 
   async function parseErrorMessage(response, fallback) {
@@ -1725,6 +1774,9 @@ export default function HomePage() {
   }
 
   useEffect(() => {
+    if (!isAuthReady || !isAuthenticated) {
+      return;
+    }
     loadDocuments();
     loadTaxonomy();
     loadUsers();
@@ -1736,7 +1788,7 @@ export default function HomePage() {
       loadQAHistory();
     }, 3000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [isAuthReady, isAuthenticated]);
 
   useEffect(() => {
     if (!cornerMessage) return;
@@ -1868,6 +1920,76 @@ export default function HomePage() {
     await Promise.all([loadDocuments(), loadTaxonomy()]);
   }
 
+  if (!isAuthReady) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-100 dark:bg-slate-950">
+        <div className="inline-flex items-center gap-2 rounded-lg bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm dark:bg-slate-900 dark:text-slate-200">
+          <span className="material-symbols-outlined text-base">hourglass_top</span>
+          Tekshirilmoqda...
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen bg-slate-100 dark:bg-slate-950 px-4 py-10">
+        <div className="mx-auto w-full max-w-md overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-900">
+          <div className="h-24 bg-gradient-to-r from-primary/20 via-slate-100 to-primary/5 dark:from-primary/10 dark:via-slate-800 dark:to-primary/5" />
+          <div className="px-7 py-8">
+            <h1 className="text-3xl font-black text-slate-900 dark:text-slate-100">Tizimga kirish</h1>
+            <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
+              Dashboard sahifalariga kirish uchun login va parol kiriting.
+            </p>
+
+            <form onSubmit={handleLoginSubmit} className="mt-6 space-y-4">
+              <label className="block">
+                <span className="mb-1 block text-sm font-semibold text-slate-700 dark:text-slate-300">
+                  Login
+                </span>
+                <input
+                  type="text"
+                  name="username"
+                  value={loginForm.username}
+                  onChange={handleLoginFieldChange}
+                  autoComplete="username"
+                  placeholder="Loginni kiriting"
+                  className="h-11 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-1 block text-sm font-semibold text-slate-700 dark:text-slate-300">
+                  Parol
+                </span>
+                <input
+                  type="password"
+                  name="password"
+                  value={loginForm.password}
+                  onChange={handleLoginFieldChange}
+                  autoComplete="current-password"
+                  placeholder="Parolni kiriting"
+                  className="h-11 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                />
+              </label>
+
+              {loginError ? (
+                <p className="text-sm font-semibold text-red-600 dark:text-red-400">{loginError}</p>
+              ) : null}
+
+              <button
+                type="submit"
+                className="mt-2 inline-flex h-11 w-full items-center justify-center rounded-xl bg-primary px-4 text-sm font-bold text-white transition hover:bg-primary/90"
+              >
+                Kirish
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen overflow-hidden">
       <aside className="w-64 flex-shrink-0 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col">
@@ -1940,6 +2062,14 @@ export default function HomePage() {
           <div className="flex items-center gap-4">
             <button onClick={toggleTheme} className="p-2 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors" title="Mavzu almashtirish">
               <span className="material-symbols-outlined">{theme === "dark" ? "light_mode" : "dark_mode"}</span>
+            </button>
+            <button
+              onClick={handleLogout}
+              className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+              title="Chiqish"
+            >
+              <span className="material-symbols-outlined text-[16px]">logout</span>
+              Chiqish
             </button>
             <button className="p-2 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg relative transition-colors">
               <span className="material-symbols-outlined">notifications</span>
@@ -2098,3 +2228,4 @@ export default function HomePage() {
     </div>
   );
 }
+
