@@ -394,9 +394,19 @@ def run_document_pipeline(document_id: str):
 
         inferred_code = extract_doc_code_from_html(soup)
         if inferred_code and inferred_code != document.code:
-            document.code = inferred_code
-            db.add(document)
-            db.commit()
+            duplicate = (
+                db.query(Document)
+                .filter(
+                    Document.category_id == document.category_id,
+                    Document.code == inferred_code,
+                    Document.id != doc_id,
+                )
+                .one_or_none()
+            )
+            if duplicate is None:
+                document.code = inferred_code
+                db.add(document)
+                db.commit()
 
         elements = list(soup.find_all(["div", "a", "table", "img"]))
         total_elements = max(len(elements), 1)
