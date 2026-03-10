@@ -716,6 +716,10 @@ def run_document_pipeline(document_id: str):
         except Exception:
             db.rollback()
     except Exception as exc:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:
+            pass
         doc_process = None
         try:
             parsed_id = uuid.UUID(document_id)
@@ -723,12 +727,19 @@ def run_document_pipeline(document_id: str):
         except Exception:
             doc_process = None
         if doc_process:
-            _touch_process(
-                db,
-                doc_process,
-                status="failed",
-                stage="failed",
-                error=str(exc),
-            )
+            try:
+                _touch_process(
+                    db,
+                    doc_process,
+                    status="failed",
+                    stage="failed",
+                    error=str(exc),
+                )
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        print(f"[pipeline] document_id={document_id} failed: {exc}")
     finally:
         db.close()
