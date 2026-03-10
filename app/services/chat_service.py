@@ -37,8 +37,8 @@ from app.services.llm_service import (
 
 DOCUMENT_CODE_RE = re.compile(r"\b(shnq|qmq|kmk|snip)\s*([0-9][0-9.\-]*)\b", re.IGNORECASE)
 TABLE_NUMBER_RE = re.compile(
-    r"(?:\bjadval(?:da|ni|ga|dan|ning|lar)?\s*[-.]?\s*(\d+[a-z]?)\b|"
-    r"\b(\d+[a-z]?)\s*[-.]?\s*jadval(?:da|ni|ga|dan|ning|lar)?\b)",
+    r"(?:\bjadval(?:da|ni|ga|dan|ning|lar)?\s*[-.]?\s*(\d+(?:\.\d+)*[a-z]?)\b|"
+    r"\b(\d+(?:\.\d+)*[a-z]?)\s*[-.]?\s*jadval(?:da|ni|ga|dan|ning|lar)?\b)",
     re.IGNORECASE,
 )
 APPENDIX_NUMBER_RE = re.compile(
@@ -198,7 +198,7 @@ def _extract_table_number(text: str) -> str | None:
     match = TABLE_NUMBER_RE.search(_normalize_text(text))
     if not match:
         return None
-    return (match.group(1) or match.group(2) or "").strip()
+    return (match.group(1) or match.group(2) or "").strip().replace(",", ".")
 
 
 def _extract_appendix_number(text: str) -> str | None:
