@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body {
+  min-height: 100%;
+}
+
+.material-symbols-outlined {
+  font-family: "Material Symbols Outlined";
+  font-weight: normal;
+  font-style: normal;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  -webkit-font-smoothing: antialiased;
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+  vertical-align: middle;
+}
+
+.sticky-col {
+  position: sticky;
+  left: 0;
+  z-index: 10;
+}
+
+.sticky-col-2 {
+  position: sticky;
+  left: 140px;
+  z-index: 10;
+}
+
+.pulsing-dot {
+  width: 8px;
+  height: 8px;
+  background-color: #135bec;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 0 rgba(19, 91, 236, 0.4);
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(19, 91, 236, 0.7);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(19, 91, 236, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(19, 91, 236, 0);
+  }
+}
