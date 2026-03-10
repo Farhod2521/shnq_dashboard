@@ -33,7 +33,11 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def _resume_stuck_document_pipelines():
-        resumed = resume_document_pipelines_on_startup(include_failed=False, limit=1000)
+        resumed = resume_document_pipelines_on_startup(
+            include_failed=False,
+            limit=1000,
+            max_parallel=None,
+        )
         if resumed:
             print(f"[startup] Resumed {resumed} stuck document pipeline(s).")
 

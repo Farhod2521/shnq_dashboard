@@ -1,6 +1,7 @@
 import os
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
@@ -8,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.config import settings
 from app.db.dependency import get_db
 from app.db.session import SessionLocal
 from app.models.category import Category
@@ -288,13 +290,37 @@ def _set_process_queued(db: Session, document_id: uuid.UUID):
     db.add(process)
 
 
-def _run_pipeline_batch(document_ids: list[str]):
-    for document_id in document_ids:
-        try:
-            run_document_pipeline(document_id)
-        except Exception:
-            # Individual pipeline xatoligi DocumentProcess status=failed ga tushadi.
-            continue
+def _resolve_parallel_workers(document_ids: list[str], max_parallel: int | None = None) -> int:
+    if not document_ids:
+        return 0
+    requested = settings.PIPELINE_MAX_PARALLEL if max_parallel is None else max_parallel
+    if requested <= 0:
+        return len(document_ids)
+    return max(1, min(requested, len(document_ids)))
+
+
+def _run_pipeline_batch(document_ids: list[str], max_parallel: int | None = None):
+    if not document_ids:
+        return
+
+    worker_count = _resolve_parallel_workers(document_ids, max_parallel=max_parallel)
+    if worker_count <= 1:
+        for document_id in document_ids:
+            try:
+                run_document_pipeline(document_id)
+            except Exception:
+                # Individual pipeline xatoligi DocumentProcess status=failed ga tushadi.
+                continue
+        return
+
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="doc-pipeline") as executor:
+        futures = [executor.submit(run_document_pipeline, document_id) for document_id in document_ids]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                # Individual pipeline xatoligi qolgan ishlarni to'xtatmasin.
+                continue
 
 
 def _collect_requeue_targets(
@@ -324,7 +350,12 @@ def _requeue_process_rows(db: Session, process_rows: list[DocumentProcess]) -> l
     return [str(row.document_id) for row in process_rows]
 
 
-def resume_document_pipelines_on_startup(*, include_failed: bool = False, limit: int = 500) -> int:
+def resume_document_pipelines_on_startup(
+    *,
+    include_failed: bool = False,
+    limit: int = 500,
+    max_parallel: int | None = None,
+) -> int:
     db = SessionLocal()
     try:
         process_rows = _collect_requeue_targets(
@@ -341,7 +372,7 @@ def resume_document_pipelines_on_startup(*, include_failed: bool = False, limit:
 
     worker = threading.Thread(
         target=_run_pipeline_batch,
-        args=(document_ids,),
+        args=(document_ids, max_parallel),
         daemon=True,
         name="document-pipeline-recovery",
     )
@@ -676,6 +707,7 @@ def requeue_stuck_documents(
     background_tasks: BackgroundTasks,
     include_failed: bool = Query(default=False),
     limit: int = Query(default=500, ge=1, le=5000),
+    max_parallel: int = Query(default=0, ge=0, le=128),
     db: Session = Depends(get_db),
 ):
     process_rows = _collect_requeue_targets(
@@ -691,7 +723,8 @@ def requeue_stuck_documents(
             documentIds=[],
         )
 
-    background_tasks.add_task(_run_pipeline_batch, document_ids)
+    effective_parallel = None if max_parallel == 0 else max_parallel
+    background_tasks.add_task(_run_pipeline_batch, document_ids, effective_parallel)
     return DocumentRequeueResponse(
         detail="Hujjatlar qayta navbatga qo'yildi va pipeline ishga tushirildi.",
         queuedCount=len(document_ids),

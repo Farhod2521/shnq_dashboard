@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     RAG_DOC_DOMINANCE_MIN_RATIO: float = 0.8
     RAG_STRONG_KEYWORD_MIN: float = 0.3
     RAG_DOMINANCE_WINDOW: int = 5
+    PIPELINE_MAX_PARALLEL: int = 0  # 0 = barcha requeue hujjatlarni bir vaqtda ishga tushirish
 
     model_config = SettingsConfigDict(
         env_file=".env",
