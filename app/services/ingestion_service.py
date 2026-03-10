@@ -251,24 +251,49 @@ def _touch_process(
     row_embedding: int | None = None,
     img_embedding: int | None = None,
     error: str | None | object = _ERR_UNSET,
+    commit: bool = True,
 ):
+    changed = False
     if status is not None:
-        process.status = status
+        if process.status != status:
+            process.status = status
+            changed = True
     if stage is not None:
-        process.stage = stage
+        if process.stage != stage:
+            process.stage = stage
+            changed = True
     if doc_html is not None:
-        process.doc_html_progress = max(0, min(100, doc_html))
+        next_value = max(0, min(100, doc_html))
+        if process.doc_html_progress != next_value:
+            process.doc_html_progress = next_value
+            changed = True
     if chunking is not None:
-        process.chunking_progress = max(0, min(100, chunking))
+        next_value = max(0, min(100, chunking))
+        if process.chunking_progress != next_value:
+            process.chunking_progress = next_value
+            changed = True
     if row_embedding is not None:
-        process.row_embedding_progress = max(0, min(100, row_embedding))
+        next_value = max(0, min(100, row_embedding))
+        if process.row_embedding_progress != next_value:
+            process.row_embedding_progress = next_value
+            changed = True
     if img_embedding is not None:
-        process.img_embedding_progress = max(0, min(100, img_embedding))
+        next_value = max(0, min(100, img_embedding))
+        if process.img_embedding_progress != next_value:
+            process.img_embedding_progress = next_value
+            changed = True
     if error is not _ERR_UNSET:
-        process.error_message = error
+        if process.error_message != error:
+            process.error_message = error
+            changed = True
+    if not changed:
+        return
     process.updated_at = datetime.utcnow()
     db.add(process)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
 
 
 def _reset_document_content(db: Session, document_id: uuid.UUID):
@@ -399,15 +424,15 @@ def run_document_pipeline(document_id: str):
                 if last_table and not last_table.html_anchor:
                     last_table.html_anchor = anchor
                     db.add(last_table)
-                    db.commit()
+                    db.flush()
                 elif last_clause and not last_clause.html_anchor:
                     last_clause.html_anchor = anchor
                     db.add(last_clause)
-                    db.commit()
+                    db.flush()
                 elif last_image and not last_image.html_anchor:
                     last_image.html_anchor = anchor
                     db.add(last_image)
-                    db.commit()
+                    db.flush()
                 else:
                     pending_anchor = anchor
                 _touch_process(db, process, doc_html=round((idx / total_elements) * 100))
@@ -419,8 +444,7 @@ def run_document_pipeline(document_id: str):
                     chapter_order += 1
                     current_chapter = Chapter(document_id=doc_id, title=header_text, order=chapter_order)
                     db.add(current_chapter)
-                    db.commit()
-                    db.refresh(current_chapter)
+                    db.flush()
                     current_appendix_number = None
                     current_appendix_title = None
                 _touch_process(db, process, doc_html=round((idx / total_elements) * 100))
@@ -453,8 +477,7 @@ def run_document_pipeline(document_id: str):
                         order=clause_order,
                     )
                     db.add(last_clause)
-                    db.commit()
-                    db.refresh(last_clause)
+                    db.flush()
                     pending_anchor = None
                 _touch_process(db, process, doc_html=round((idx / total_elements) * 100))
                 continue
@@ -481,8 +504,7 @@ def run_document_pipeline(document_id: str):
                         order=image_order,
                     )
                     db.add(last_image)
-                    db.commit()
-                    db.refresh(last_image)
+                    db.flush()
                     seen_image_sources.add(src)
                 pending_anchor = None
                 _touch_process(db, process, doc_html=round((idx / total_elements) * 100))
@@ -514,14 +536,12 @@ def run_document_pipeline(document_id: str):
                         order=table_order,
                     )
                     db.add(last_table)
-                    db.commit()
-                    db.refresh(last_table)
+                    db.flush()
                     pending_anchor = None
                     for row_idx, row_cells in enumerate(rows, start=1):
                         row_obj = NormTableRow(table_id=last_table.id, row_index=row_idx)
                         db.add(row_obj)
-                        db.commit()
-                        db.refresh(row_obj)
+                        db.flush()
                         for cell in row_cells:
                             db.add(
                                 NormTableCell(
@@ -533,7 +553,7 @@ def run_document_pipeline(document_id: str):
                                     col_span=cell["col_span"],
                                 )
                             )
-                        db.commit()
+                        db.flush()
                 _touch_process(db, process, doc_html=round((idx / total_elements) * 100))
 
         _touch_process(db, process, stage="chunking", chunking=0)
@@ -584,8 +604,14 @@ def run_document_pipeline(document_id: str):
                             search_text=search_text,
                         )
                     )
-            db.commit()
-            _touch_process(db, process, row_embedding=round((idx / total_rows) * 100))
+            _touch_process(
+                db,
+                process,
+                row_embedding=round((idx / total_rows) * 100),
+                commit=False,
+            )
+            if idx % 20 == 0 or idx == total_rows:
+                db.commit()
 
         _touch_process(db, process, stage="img_embedding", img_embedding=0)
         images = db.query(NormImage).filter(NormImage.document_id == doc_id).order_by(NormImage.order).all()
@@ -626,8 +652,14 @@ def run_document_pipeline(document_id: str):
                         image_url=image.image_url,
                     )
                 )
-            db.commit()
-            _touch_process(db, process, img_embedding=round((idx / total_images) * 100))
+            _touch_process(
+                db,
+                process,
+                img_embedding=round((idx / total_images) * 100),
+                commit=False,
+            )
+            if idx % 10 == 0 or idx == total_images:
+                db.commit()
 
         process.finished_at = datetime.utcnow()
         _touch_process(
