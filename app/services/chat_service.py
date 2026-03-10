@@ -338,9 +338,29 @@ def _is_document_list_request(text: str) -> bool:
     return any(phrase in normalized for phrase in ("qaysi shnq", "qaysi hujjat", "qaysi norma", "qaysi normativ"))
 
 
-def _build_document_list_answer(codes: list[str], response_language: str) -> str:
+def _format_document_options(docs: list[str], title_by_code: dict[str, str] | None = None) -> str:
+    mapping = title_by_code or {}
+    lines: list[str] = []
+    for idx, code in enumerate(docs, start=1):
+        title = mapping.get(code.lower())
+        if title:
+            lines.append(f"{idx}. {code} - {title}")
+        else:
+            lines.append(f"{idx}. {code}")
+    return "\n".join(lines)
+
+
+def _build_document_list_answer(
+    codes: list[str],
+    response_language: str,
+    title_by_code: dict[str, str] | None = None,
+) -> str:
     detailed_label, short_label = _answer_labels(response_language)
-    detail = "Savolga mos kontekstda quyidagi SHNQ hujjatlari keltirilgan:\n" + "\n".join(f"- {code}" for code in codes)
+    detail = (
+        "Savolga mos quyidagi SHNQ hujjatlarida kerakli javob uchraydi:\n"
+        + _format_document_options(codes, title_by_code)
+        + "\nAynan qaysi SHNQ nazarda tutilayotganini yozing."
+    )
     short = ", ".join(codes[:3])
     if len(codes) > 3:
         short += " va boshqalar."
@@ -824,19 +844,24 @@ def _get_document_titles_by_code(db: Session, docs: list[str]) -> dict[str, str]
 
 
 def _build_document_clarification_answer(docs: list[str], title_by_code: dict[str, str] | None = None) -> str:
-    lines = []
-    mapping = title_by_code or {}
-    for code in docs:
-        title = mapping.get(code.lower())
-        if title:
-            lines.append(f"- {code} {title}")
-        else:
-            lines.append(f"- {code}")
-
     return (
-        "Savolda bir nechta hujjatda mos variant topildi. "
-        "Aniq javob uchun qaysi hujjat kerakligini tanlang:\n"
-        + "\n".join(lines)
+        "Shu SHNQ hujjatlarida siz so'ragan savolga mos javob bor. "
+        "Aynan qaysi SHNQ nazarda tutilyapti?\n"
+        + _format_document_options(docs, title_by_code)
+    )
+
+
+def _build_table_document_clarification_answer(
+    table_number: str,
+    docs: list[str],
+    title_by_code: dict[str, str] | None = None,
+) -> str:
+    if not docs:
+        return f"{table_number}-jadval qaysi hujjatda kerak? (masalan: SHNQ 2.07.01-23)"
+    return (
+        f"{table_number}-jadval quyidagi SHNQ hujjatlarida uchraydi. "
+        "Aynan qaysi SHNQ nazarda tutilyapti?\n"
+        + _format_document_options(docs, title_by_code)
     )
 
 
@@ -1046,7 +1071,7 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             if len(docs) == 1 and table:
                 doc_code = docs[0]
             else:
-                hint = f" Mavjudlari: {', '.join(docs)}." if docs else ""
+                title_by_code = _get_document_titles_by_code(db, docs)
                 meta = {
                     "type": "clarification",
                     "missing_case": "missing_document_for_table",
@@ -1056,7 +1081,7 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                 }
                 _attach_timing_meta(meta, timings, started_at)
                 return {
-                    "answer": f"{table_number}-jadval qaysi hujjatda kerak? (masalan: SHNQ 2.07.01-23).{hint}",
+                    "answer": _build_table_document_clarification_answer(table_number, docs, title_by_code),
                     "sources": [],
                     "table_html": None,
                     "image_urls": [],
@@ -1286,7 +1311,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         context_codes = _collect_codes_from_items(merged)
         answer_codes = _extract_document_codes(answer or "")
         if context_codes and not answer_codes:
-            answer = _build_document_list_answer(context_codes, detected_language)
+            title_by_code = _get_document_titles_by_code(db, context_codes)
+            answer = _build_document_list_answer(context_codes, detected_language, title_by_code)
 
     answer = _cleanup_answer_format(answer, response_language=detected_language)
     t_out = time.perf_counter()
