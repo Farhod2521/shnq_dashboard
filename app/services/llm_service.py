@@ -1,5 +1,6 @@
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from functools import lru_cache
 from urllib.parse import urlencode
 
@@ -205,6 +206,12 @@ def _normalize_vector(vec: list[float]) -> list[float]:
     return [v / norm for v in vec]
 
 
+def _encode_with_local_model(value: str) -> list[float]:
+    embedder = _get_embedder()
+    vector = embedder.encode([value], convert_to_numpy=True, normalize_embeddings=True)[0]
+    return [float(v) for v in vector.tolist()]
+
+
 def embed_text(text: str) -> list[float]:
     value = (text or "").strip()
     if not value:
@@ -214,7 +221,7 @@ def embed_text(text: str) -> list[float]:
     hf_token = settings.HF_TOKEN
     if hf_token:
         try:
-            with httpx.Client(timeout=90) as client:
+            with httpx.Client(timeout=settings.EMBEDDING_TIMEOUT_SECONDS) as client:
                 resp = client.post(
                     f"https://api-inference.huggingface.co/models/{settings.EMBEDDING_MODEL}",
                     headers={"Authorization": f"Bearer {hf_token}"},
@@ -240,9 +247,17 @@ def embed_text(text: str) -> list[float]:
             pass
 
     # Fallback path: local sentence-transformers.
-    embedder = _get_embedder()
-    vector = embedder.encode([value], convert_to_numpy=True, normalize_embeddings=True)[0]
-    return [float(v) for v in vector.tolist()]
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-embed")
+    future = executor.submit(_encode_with_local_model, value)
+    try:
+        return future.result(timeout=settings.EMBEDDING_TIMEOUT_SECONDS)
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(
+            f"Embedding timeout after {settings.EMBEDDING_TIMEOUT_SECONDS} seconds"
+        ) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 @lru_cache(maxsize=1)

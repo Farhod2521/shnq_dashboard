@@ -1161,6 +1161,7 @@ function EmbeddingTekshiruvModal({
 
 function HujjatlarSahifasi({ documents, onOpenModal, onRefresh, onOpenEmbeddings, onEdit, onDelete }) {
   const processingCount = documents.filter((d) => d.status === "processing").length;
+  const stuckCount = documents.filter((d) => d.status === "processing" || d.status === "queued").length;
 
   return (
     <div className="flex-1 overflow-hidden flex flex-col p-6 space-y-6">
@@ -1170,6 +1171,15 @@ function HujjatlarSahifasi({ documents, onOpenModal, onRefresh, onOpenEmbeddings
           <p className="text-sm text-slate-500 dark:text-slate-400">Hujjatlarning DOC dan embeddinggacha bo'lgan jarayoni.</p>
         </div>
         <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => onRefresh(true)}
+            className="inline-flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-700 transition hover:bg-amber-100 dark:border-amber-900/60 dark:bg-amber-900/20 dark:text-amber-300"
+            title="Qotib qolgan pipeline'larni qayta navbatga qo'yish"
+          >
+            <span className="material-symbols-outlined text-[18px]">restart_alt</span>
+            Qayta ishga tushirish ({stuckCount})
+          </button>
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-green-50 dark:bg-green-900/20 border border-green-100 dark:border-green-800">
             <span className="relative flex h-2 w-2">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
@@ -1177,7 +1187,7 @@ function HujjatlarSahifasi({ documents, onOpenModal, onRefresh, onOpenEmbeddings
             </span>
             <span className="text-xs font-bold text-green-700 dark:text-green-400 uppercase tracking-widest">Tizim holati: me'yorida</span>
           </div>
-          <button onClick={onRefresh} className="flex items-center justify-center h-10 w-10 bg-primary text-white rounded-lg shadow-lg shadow-primary/20 hover:bg-primary/90 transition-all" title="Yangilash">
+          <button onClick={() => onRefresh()} className="flex items-center justify-center h-10 w-10 bg-primary text-white rounded-lg shadow-lg shadow-primary/20 hover:bg-primary/90 transition-all" title="Yangilash">
             <span className="material-symbols-outlined text-[20px]">refresh</span>
           </button>
         </div>
@@ -1430,6 +1440,33 @@ export default function HomePage() {
     } finally {
       setIsLoadingDocs(false);
     }
+  }
+
+  async function requeueStuckDocuments() {
+    try {
+      const response = await fetch(`${API_BASE}/api/upload/documents/requeue-stuck`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        throw new Error(await parseErrorMessage(response, "Hujjatlarni qayta ishga tushirishda xatolik"));
+      }
+      const result = await response.json();
+      setCornerType("success");
+      setCornerMessage(result?.detail || "Hujjatlar qayta navbatga qo'yildi");
+      await loadDocuments();
+    } catch (error) {
+      console.error("Stuck hujjatlarni qayta ishga tushirishda xatolik:", error);
+      setCornerType("error");
+      setCornerMessage(error?.message || "Qayta ishga tushirishda xatolik");
+    }
+  }
+
+  async function refreshDocuments(forceRequeue = false) {
+    if (forceRequeue) {
+      await requeueStuckDocuments();
+      return;
+    }
+    await loadDocuments();
   }
 
   async function loadTaxonomy() {
@@ -2090,7 +2127,7 @@ export default function HomePage() {
           <HujjatlarSahifasi
             documents={sortedDocuments}
             onOpenModal={openCreateDocumentModal}
-            onRefresh={loadDocuments}
+            onRefresh={refreshDocuments}
             onOpenEmbeddings={openEmbeddingsModal}
             onEdit={openEditDocumentModal}
             onDelete={deleteDocument}
