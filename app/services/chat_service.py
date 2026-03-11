@@ -95,6 +95,20 @@ ROW_FOCUS_TERMS = {
     "quvvat",
     "talab",
 }
+NUMERIC_REQUIREMENT_HINTS = {
+    "minimal",
+    "maksimal",
+    "kamida",
+    "ko'pi",
+    "masofa",
+    "foiz",
+    "ulush",
+    "norma",
+    "me'yor",
+    "meyor",
+    "qancha",
+    "necha",
+}
 QUERY_STOPWORDS = {
     "uchun",
     "bilan",
@@ -389,7 +403,10 @@ def _stem_query_token(token: str) -> str:
 def _is_table_row_priority_query(text: str) -> bool:
     normalized = _normalize_text(text)
     if any(phrase in normalized for phrase in ("qaysi shnq", "qaysi hujjat", "qaysi norma", "qaysi normativ")):
-        return True
+        return False
+    has_table_hint = any(term in normalized for term in ("jadval", "satr", "ustun", "table", "ilova"))
+    if not has_table_hint:
+        return False
     has_focus_term = any(term in normalized for term in ROW_FOCUS_TERMS)
     has_question_intent = any(word in normalized for word in ("qaysi", "qanday", "keltirilgan", "berilgan", "talab"))
     return has_focus_term and has_question_intent
@@ -401,6 +418,11 @@ def _is_table_intent_query(text: str) -> bool:
         return True
     explicit_terms = ("jadval", "satr", "ustun", "ilova", "appendix", "table")
     return any(term in normalized for term in explicit_terms)
+
+
+def _is_numeric_requirement_query(text: str) -> bool:
+    normalized = _normalize_text(text)
+    return any(token in normalized for token in NUMERIC_REQUIREMENT_HINTS)
 
 
 def _extract_document_codes(text: str) -> list[str]:
@@ -1167,7 +1189,9 @@ def _build_table_qa_answer(question: str, table: NormTable, response_language: s
 def _select_context_items(query: str, items: list[RetrievalItem]) -> list[RetrievalItem]:
     if not items:
         return []
-    if _is_table_intent_query(query):
+    table_intent = _is_table_intent_query(query)
+    row_priority = _is_table_row_priority_query(query)
+    if table_intent:
         row_items = [item for item in items if item.kind == "table_row"]
         other_items = [item for item in items if item.kind != "table_row"]
         if row_items:
@@ -1175,13 +1199,20 @@ def _select_context_items(query: str, items: list[RetrievalItem]) -> list[Retrie
             selected.sort(key=lambda x: x.score, reverse=True)
             return selected[:6]
         return items[:6]
-    if not _is_table_row_priority_query(query):
-        return items[:6]
+    if not row_priority:
+        clause_items = [item for item in items if item.kind == "clause"]
+        if clause_items:
+            return clause_items[:6]
+        image_items = [item for item in items if item.kind == "image"]
+        if image_items:
+            return image_items[:3]
+        return []
 
     row_items = [item for item in items if item.kind == "table_row"]
     other_items = [item for item in items if item.kind != "table_row"]
     if not row_items:
-        return items[:6]
+        clause_items = [item for item in other_items if item.kind == "clause"]
+        return clause_items[:6] if clause_items else other_items[:6]
 
     selected = [*row_items[:4], *other_items[:3]]
     selected.sort(key=lambda x: x.score, reverse=True)
@@ -1359,34 +1390,52 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             clause_items = keyword_hits[: settings.RAG_TOP_K]
 
         clause_best_score = clause_items[0].score if clause_items else 0.0
-        hint = any(h in _normalize_text(query_text) for h in ["jadval", "table", "satr", "ilova", "appendix", "rasm", "image", "diagramma", "sxema"])
+        normalized_query = _normalize_text(query_text)
         row_priority = _is_table_row_priority_query(query_text)
         table_intent = _is_table_intent_query(query_text)
-        row_top_k = settings.RAG_TABLE_INTENT_ROW_TOP_K if table_intent else settings.RAG_TABLE_ROW_TOP_K
-        need_rich_sources = (
-            hint
-            or row_priority
-            or table_intent
-            or clause_best_score < settings.RAG_RICH_SOURCE_CLAUSE_THRESHOLD
-        )
-        row_items = _search_table_row_candidates(
-            db,
-            query_text,
-            query_vec,
-            requested_doc_code,
-            row_priority=row_priority,
-            limit_override=row_top_k,
-        ) if need_rich_sources else []
-        if need_rich_sources and (row_priority or not row_items):
-            row_fallback = _search_table_row_keyword_fallback(
+        numeric_requirement = _is_numeric_requirement_query(query_text)
+        allow_table_search = table_intent or row_priority
+        soft_table_probe = (not allow_table_search) and numeric_requirement and clause_best_score < settings.RAG_MIN_SCORE
+
+        row_items: list[RetrievalItem] = []
+        if allow_table_search or soft_table_probe:
+            row_top_k = settings.RAG_TABLE_INTENT_ROW_TOP_K if table_intent else settings.RAG_TABLE_ROW_TOP_K
+            if soft_table_probe:
+                row_top_k = min(max(2, row_top_k), 3)
+            row_items = _search_table_row_candidates(
                 db,
                 query_text,
+                query_vec,
                 requested_doc_code,
-                limit=max(row_top_k, 8),
+                row_priority=row_priority,
+                limit_override=row_top_k,
             )
-            if row_fallback:
-                row_items = _merge_retrieval_candidates(row_items, row_fallback, secondary_weight=1.05)
-        image_items = _search_image_candidates(db, query_text, query_vec, requested_doc_code) if need_rich_sources else []
+            if soft_table_probe:
+                strict_score = max(0.55, settings.RAG_TABLE_ROW_MIN_SCORE + 0.22)
+                row_items = [
+                    item
+                    for item in row_items
+                    if item.score >= strict_score and float(item.keyword_score or 0.0) >= 0.32
+                ]
+            if allow_table_search and (row_priority or not row_items):
+                row_fallback = _search_table_row_keyword_fallback(
+                    db,
+                    query_text,
+                    requested_doc_code,
+                    limit=max(row_top_k, 8),
+                )
+                if row_fallback:
+                    row_items = _merge_retrieval_candidates(row_items, row_fallback, secondary_weight=1.05)
+
+        image_intent = any(h in normalized_query for h in ["rasm", "image", "diagramma", "sxema", "surat", "chizma"])
+        need_image_sources = image_intent or clause_best_score < settings.RAG_MIN_SCORE
+        image_items = _search_image_candidates(db, query_text, query_vec, requested_doc_code) if need_image_sources else []
+        if image_items and not image_intent:
+            image_items = [
+                item
+                for item in image_items
+                if item.score >= max(settings.RAG_IMAGE_MIN_SCORE + 0.08, 0.3)
+            ]
         return clause_items, row_items, image_items
 
     clause_items, row_items, image_items = compute_candidates(rewritten_primary)
