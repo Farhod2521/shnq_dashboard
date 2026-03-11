@@ -346,6 +346,19 @@ def _collect_requeue_targets(
     )
 
 
+def _collect_documents_without_process(db: Session, *, limit: int = 500) -> list[Document]:
+    if limit <= 0:
+        return []
+    process_doc_ids = db.query(DocumentProcess.document_id)
+    return (
+        db.query(Document)
+        .filter(~Document.id.in_(process_doc_ids))
+        .order_by(Document.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+
 def _requeue_process_rows(db: Session, process_rows: list[DocumentProcess]) -> list[str]:
     if not process_rows:
         return []
@@ -395,6 +408,14 @@ def resume_document_pipelines_on_startup(
             limit=limit,
         )
         document_ids = _requeue_process_rows(db, process_rows)
+        remaining = max(0, limit - len(document_ids))
+        if remaining > 0:
+            missing_docs = _collect_documents_without_process(db, limit=remaining)
+            for doc in missing_docs:
+                _set_process_queued(db, doc.id)
+                document_ids.append(str(doc.id))
+            if missing_docs:
+                db.commit()
     finally:
         db.close()
 
@@ -749,6 +770,16 @@ def requeue_stuck_documents(
         limit=limit,
     )
     document_ids = _requeue_process_rows(db, process_rows)
+
+    remaining = max(0, limit - len(document_ids))
+    if remaining > 0:
+        missing_docs = _collect_documents_without_process(db, limit=remaining)
+        for doc in missing_docs:
+            _set_process_queued(db, doc.id)
+            document_ids.append(str(doc.id))
+        if missing_docs:
+            db.commit()
+
     if not document_ids:
         return DocumentRequeueResponse(
             detail="Qayta navbatga qo'yiladigan hujjat topilmadi.",
