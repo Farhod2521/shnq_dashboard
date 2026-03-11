@@ -395,6 +395,14 @@ def _is_table_row_priority_query(text: str) -> bool:
     return has_focus_term and has_question_intent
 
 
+def _is_table_intent_query(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if _is_table_request(normalized):
+        return True
+    explicit_terms = ("jadval", "satr", "ustun", "ilova", "appendix", "table")
+    return any(term in normalized for term in explicit_terms)
+
+
 def _extract_document_codes(text: str) -> list[str]:
     normalized = _normalize_text(text)
     out: list[str] = []
@@ -515,8 +523,11 @@ def _search_table_row_candidates(
     query_vec: list[float],
     doc_code: str | None,
     row_priority: bool = False,
+    limit_override: int | None = None,
 ) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
+    if not terms and not row_priority:
+        return []
     normalized_query = _normalize_text(query)
     out: list[RetrievalItem] = []
     db_q = db.query(TableRowEmbedding).options(
@@ -525,7 +536,19 @@ def _search_table_row_candidates(
     )
     if doc_code:
         db_q = db_q.filter(TableRowEmbedding.shnq_code == doc_code)
-    for emb in db_q.all():
+    effective_top_k = max(1, int(limit_override or settings.RAG_TABLE_ROW_TOP_K))
+    scan_limit = max(settings.RAG_TABLE_ROW_SCAN_LIMIT, effective_top_k * 60)
+    if terms:
+        filters = [TableRowEmbedding.search_text.ilike(f"%{term}%") for term in terms[:4]]
+        candidates = db_q.filter(or_(*filters)).limit(scan_limit).all()
+        if not candidates:
+            # Query lexical termlari embedding search_textda topilmasa ham
+            # kichik sample'da semantic tekshiruvni saqlab qolamiz.
+            candidates = db_q.limit(min(400, scan_limit)).all()
+    else:
+        candidates = db_q.limit(min(400, scan_limit)).all()
+
+    for emb in candidates:
         table = emb.row.table if emb.row else None
         combined_text = " | ".join(
             part
@@ -567,7 +590,7 @@ def _search_table_row_candidates(
             )
         )
     out.sort(key=lambda x: x.score, reverse=True)
-    return out[: max(1, settings.RAG_TABLE_ROW_TOP_K)]
+    return out[: effective_top_k]
 
 
 def _search_table_row_keyword_fallback(
@@ -829,12 +852,18 @@ def _build_rag_prompt(
         fewshot_block = "\n\nJavob uslubi namunalari:\n" + "\n\n".join(parts)
     detailed_label, short_label = _answer_labels(response_language)
     doc_list_instruction = ""
+    table_instruction = ""
     if _is_document_list_request(question):
         doc_list_instruction = " Agar savolda qaysi SHNQ/hujjat so'ralgan bo'lsa, kontekstdagi SHNQ kodlarini to'liq ro'yxat qilib bering."
+    if _is_table_intent_query(question):
+        table_instruction = (
+            " Agar savol jadval/satr haqida bo'lsa, avval jadval satri kontekstiga tayangan holda javob bering, "
+            "jadval raqami va satrni ko'rsating. Jadval bo'yicha aniq ma'lumot topilmasa, buni ochiq yozing."
+        )
     system = (
         "Siz SHNQ AI'siz. Faqat SHNQ/QMQ va qurilish normalari hujjatlariga tayangan holda javob bering. "
         "Hech qachon norma o'ylab topmang. Kontekstda javob bo'lmasa, buni ochiq ayting. "
-        f"Javobda faqat ikki qism bo'lsin: batafsil va qisqa xulosa.{doc_list_instruction}"
+        f"Javobda faqat ikki qism bo'lsin: batafsil va qisqa xulosa.{doc_list_instruction}{table_instruction}"
     )
     prompt = (
         f"Savol: {question}\n\nKontekst:\n{context}{fewshot_block}\n\n"
@@ -1089,6 +1118,14 @@ def _build_table_qa_answer(question: str, table: NormTable, response_language: s
 def _select_context_items(query: str, items: list[RetrievalItem]) -> list[RetrievalItem]:
     if not items:
         return []
+    if _is_table_intent_query(query):
+        row_items = [item for item in items if item.kind == "table_row"]
+        other_items = [item for item in items if item.kind != "table_row"]
+        if row_items:
+            selected = [*row_items[:4], *other_items[:2]]
+            selected.sort(key=lambda x: x.score, reverse=True)
+            return selected[:6]
+        return items[:6]
     if not _is_table_row_priority_query(query):
         return items[:6]
 
@@ -1268,20 +1305,28 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         clause_best_score = clause_items[0].score if clause_items else 0.0
         hint = any(h in _normalize_text(query_text) for h in ["jadval", "table", "satr", "ilova", "appendix", "rasm", "image", "diagramma", "sxema"])
         row_priority = _is_table_row_priority_query(query_text)
-        need_rich_sources = hint or row_priority or clause_best_score < 0.55
+        table_intent = _is_table_intent_query(query_text)
+        row_top_k = settings.RAG_TABLE_INTENT_ROW_TOP_K if table_intent else settings.RAG_TABLE_ROW_TOP_K
+        need_rich_sources = (
+            hint
+            or row_priority
+            or table_intent
+            or clause_best_score < settings.RAG_RICH_SOURCE_CLAUSE_THRESHOLD
+        )
         row_items = _search_table_row_candidates(
             db,
             query_text,
             query_vec,
             requested_doc_code,
             row_priority=row_priority,
+            limit_override=row_top_k,
         ) if need_rich_sources else []
         if need_rich_sources and (row_priority or not row_items):
             row_fallback = _search_table_row_keyword_fallback(
                 db,
                 query_text,
                 requested_doc_code,
-                limit=max(settings.RAG_TABLE_ROW_TOP_K, 8),
+                limit=max(row_top_k, 8),
             )
             if row_fallback:
                 row_items = _merge_retrieval_candidates(row_items, row_fallback, secondary_weight=1.05)
@@ -1370,13 +1415,22 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     except Exception as exc:
         llm_error = "primary_generate_failed"
         llm_error_detail = f"{type(exc).__name__}: {str(exc)[:220]}"
-        try:
-            answer = generate_answer(original_message, context="\n\n".join(i.snippet for i in merged), model=settings.CHAT_MODEL)
-            llm_used = True
-        except Exception as fallback_exc:
-            llm_error = "llm_unavailable_fallback_used"
-            llm_error_detail = f"{type(fallback_exc).__name__}: {str(fallback_exc)[:220]}"
+        error_text = (str(exc) or "").lower()
+        non_retryable = any(
+            token in error_text
+            for token in ["model not found", "does not exist", "unknown model", "invalid model"]
+        )
+        if non_retryable:
+            llm_error = "primary_generate_failed_non_retryable"
             answer = merged[0].snippet if merged else _empty_answer_text(detected_language)
+        else:
+            try:
+                answer = generate_answer(original_message, context="\n\n".join(i.snippet for i in merged), model=settings.CHAT_MODEL)
+                llm_used = True
+            except Exception as fallback_exc:
+                llm_error = "llm_unavailable_fallback_used"
+                llm_error_detail = f"{type(fallback_exc).__name__}: {str(fallback_exc)[:220]}"
+                answer = merged[0].snippet if merged else _empty_answer_text(detected_language)
 
     if not answer:
         answer = merged[0].snippet if merged else _empty_answer_text(detected_language)
@@ -1465,7 +1519,11 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         "fewshot_examples_used": len(fewshot_examples),
         "image_sources": len([i for i in merged if i.kind == "image"]),
         "table_row_sources": len([i for i in merged if i.kind == "table_row"]),
+        "table_intent": _is_table_intent_query(search_message),
         "table_prelocalized": _has_pretranslated_table_content(related_table, detected_language),
+        "table_row_scan_limit": settings.RAG_TABLE_ROW_SCAN_LIMIT,
+        "table_intent_row_top_k": settings.RAG_TABLE_INTENT_ROW_TOP_K,
+        "rich_source_clause_threshold": settings.RAG_RICH_SOURCE_CLAUSE_THRESHOLD,
         "best_score": round(best_score, 4),
         "qdrant_enabled": settings.RAG_USE_QDRANT,
         "llm_used": llm_used,

@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     RAG_FEWSHOT_FILE: str = "app/data/qa_fewshot.json"
     RAG_TABLE_ROW_TOP_K: int = 5
     RAG_TABLE_ROW_MIN_SCORE: float = 0.16
+    RAG_TABLE_ROW_SCAN_LIMIT: int = 1200
+    RAG_TABLE_INTENT_ROW_TOP_K: int = 8
+    RAG_RICH_SOURCE_CLAUSE_THRESHOLD: float = 0.42
     RAG_IMAGE_TOP_K: int = 3
     RAG_IMAGE_MIN_SCORE: float = 0.22
     RAG_MULTILINGUAL_NATIVE_FIRST: bool = True

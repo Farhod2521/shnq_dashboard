@@ -384,16 +384,10 @@ def create_session(
         return _to_session_response(session)
 
     room_value = normalized_room or str(uuid.uuid4())
-    session = (
-        db.query(ChatSession)
-        .filter(ChatSession.user_id.is_(None), ChatSession.guest_room_id == room_value)
-        .first()
-    )
-    if not session:
-        session = ChatSession(guest_room_id=room_value, title=title)
-        db.add(session)
-        db.commit()
-        db.refresh(session)
+    session = ChatSession(guest_room_id=room_value, title=title)
+    db.add(session)
+    db.commit()
+    db.refresh(session)
     return _to_session_response(session)
 
 
@@ -445,16 +439,10 @@ def chat_message(
             db.refresh(session)
         else:
             room_value = normalized_room or str(uuid.uuid4())
-            session = (
-                db.query(ChatSession)
-                .filter(ChatSession.user_id.is_(None), ChatSession.guest_room_id == room_value)
-                .first()
-            )
-            if not session:
-                session = ChatSession(guest_room_id=room_value, title=_short_title(payload.message))
-                db.add(session)
-                db.commit()
-                db.refresh(session)
+            session = ChatSession(guest_room_id=room_value, title=_short_title(payload.message))
+            db.add(session)
+            db.commit()
+            db.refresh(session)
 
         if not user:
             limit = max(1, int(settings.CHAT_GUEST_MESSAGE_LIMIT))
