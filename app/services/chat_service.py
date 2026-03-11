@@ -246,6 +246,43 @@ def _match_table_number(value: str | None, target: str) -> bool:
     return bool(source and wanted and source == wanted)
 
 
+def _table_reference_regex(table_number: str) -> re.Pattern[str]:
+    normalized = _normalize_table_reference(table_number)
+    escaped = re.escape(normalized).replace(r"\.", r"[\s,.\-]*")
+    pattern = (
+        rf"(?:\bjadval(?:da|ni|ga|dan|ning|lar)?\s*[-.]?\s*{escaped}\b|"
+        rf"\b{escaped}\s*[-.]?\s*jadval(?:da|ni|ga|dan|ning|lar)?\b)"
+    )
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def _table_reference_in_text(text: str | None, table_number: str) -> bool:
+    value = _normalize_text(text or "")
+    if not value:
+        return False
+    return bool(_table_reference_regex(table_number).search(value))
+
+
+def _table_query_terms(message: str) -> list[str]:
+    terms = _extract_query_terms(message)
+    generic = {"jadval", "table", "satr", "ustun", "ilova", "appendix"}
+    return [term for term in terms if term not in generic]
+
+
+def _score_table_candidate(message: str, table_number: str, table: NormTable) -> float:
+    terms = _table_query_terms(message)
+    title_text = " | ".join(
+        part for part in [table.title or "", table.section_title or "", table.table_number or ""] if part
+    )
+    body_text = (table.markdown or table.raw_html or "")[:2000]
+    combined = f"{title_text} | {body_text}"
+    keyword = _keyword_score(terms, combined) if terms else 0.0
+    title_keyword = _keyword_score(terms, title_text) if terms else 0.0
+    number_match = 1.0 if _match_table_number(table.table_number, table_number) else 0.0
+    mention_match = 1.0 if _table_reference_in_text(combined, table_number) else 0.0
+    return (number_match * 0.55) + (mention_match * 0.15) + (title_keyword * 0.6) + (keyword * 0.35)
+
+
 def _extract_appendix_number(text: str) -> str | None:
     match = APPENDIX_NUMBER_RE.search(_normalize_text(text))
     if not match:
@@ -289,35 +326,42 @@ def _find_tables_by_reference(
         return []
 
     query = db.query(NormTable).options(joinedload(NormTable.document), joinedload(NormTable.chapter))
-    filters = [NormTable.table_number.ilike(variant) for variant in variants]
-    for variant in variants:
-        filters.extend(
-            [
-                NormTable.title.ilike(f"%{variant}%"),
-                NormTable.markdown.ilike(f"%{variant}%"),
-                NormTable.raw_html.ilike(f"%{variant}%"),
-            ]
-        )
+    doc_key = re.sub(r"\s+", "", (doc_code or "")).lower()
 
-    candidates = query.filter(or_(*filters)).all()
-    candidates = [
-        item
-        for item in candidates
-        if _match_table_number(item.table_number, table_number)
-        or any(
-            variant.lower() in (item.title or "").lower()
-            or variant.lower() in (item.markdown or "").lower()
-            or variant.lower() in (item.raw_html or "").lower()
-            for variant in variants
-        )
-    ]
-    if doc_code:
-        key = re.sub(r"\s+", "", doc_code).lower()
-        candidates = [c for c in candidates if c.document and key in re.sub(r"\s+", "", c.document.code).lower()]
+    exact_candidates = query.filter(or_(*[NormTable.table_number.ilike(variant) for variant in variants])).all()
+    exact_candidates = [item for item in exact_candidates if _match_table_number(item.table_number, table_number)]
+
+    candidate_pool: list[NormTable]
+    if exact_candidates:
+        candidate_pool = exact_candidates
+    else:
+        # Fallback: only consider rows where explicit "N-jadval" mention exists.
+        seed = variants[0].split(".")[0] if variants else table_number
+        broad = query.filter(
+            or_(
+                NormTable.title.ilike(f"%{seed}%"),
+                NormTable.markdown.ilike(f"%{seed}%"),
+                NormTable.raw_html.ilike(f"%{seed}%"),
+            )
+        ).limit(2000).all()
+        candidate_pool = [
+            item
+            for item in broad
+            if _table_reference_in_text(item.table_number, table_number)
+            or _table_reference_in_text(item.title, table_number)
+            or _table_reference_in_text(item.markdown, table_number)
+            or _table_reference_in_text(item.raw_html, table_number)
+        ]
+    if doc_key:
+        candidate_pool = [
+            item
+            for item in candidate_pool
+            if item.document and doc_key in re.sub(r"\s+", "", (item.document.code or "")).lower()
+        ]
 
     unique: list[NormTable] = []
     seen_ids: set[str] = set()
-    for item in candidates:
+    for item in candidate_pool:
         item_id = str(item.id)
         if item_id in seen_ids:
             continue
@@ -343,6 +387,16 @@ def _find_table_for_query(
         return None, table_number, doc_code, []
     if len(candidates) == 1:
         return candidates[0], table_number, doc_code, candidates
+    scored = sorted(
+        [(_score_table_candidate(message, table_number, item), item) for item in candidates],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    top_score = scored[0][0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+    confident = top_score >= 0.72 and (top_score - second_score) >= 0.12
+    if confident:
+        return scored[0][1], table_number, doc_code, candidates
     return None, table_number, doc_code, candidates
 
 
@@ -1261,9 +1315,11 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             return {"answer": "Qaysi jadval nazarda tutilmoqda? (masalan: 9-jadval)", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
         if not doc_code:
             docs = _table_candidate_docs(db, table_number)
-            if len(docs) == 1 and table:
+            if table and table.document and table.document.code:
+                doc_code = table.document.code
+            elif len(docs) == 1 and table:
                 doc_code = docs[0]
-            else:
+            elif settings.RAG_ALLOW_DOCUMENT_SUGGESTIONS and docs:
                 title_by_code = _get_document_titles_by_code(db, docs)
                 meta = {
                     "type": "clarification",
@@ -1280,19 +1336,51 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                     "image_urls": [],
                     "meta": meta,
                 }
+            else:
+                meta = {
+                    "type": "no_match",
+                    "target": "table",
+                    "reason": "table_document_not_determined",
+                    "model": settings.CHAT_MODEL,
+                    "query_language": detected_language,
+                }
+                _attach_timing_meta(meta, timings, started_at)
+                return {
+                    "answer": f"{table_number}-jadval bo'yicha aniq hujjat topilmadi. Iltimos, SHNQ kodini ham yozing (masalan: SHNQ 2.01.05-24).",
+                    "sources": [],
+                    "table_html": None,
+                    "image_urls": [],
+                    "meta": meta,
+                }
         if not table and candidates:
             chapters = _table_candidate_chapters(candidates)
             chapter_hint = f" Variantlar: {', '.join(chapters)}." if chapters else ""
+            if settings.RAG_ALLOW_DOCUMENT_SUGGESTIONS and chapters:
+                meta = {
+                    "type": "clarification",
+                    "missing_case": "missing_table_chapter_context",
+                    "model": settings.CHAT_MODEL,
+                    "candidate_chapters": chapters,
+                    "query_language": detected_language,
+                }
+                _attach_timing_meta(meta, timings, started_at)
+                return {
+                    "answer": f"{table_number}-jadval qaysi bo'lim/bob bo'yicha kerak?{chapter_hint}",
+                    "sources": [],
+                    "table_html": None,
+                    "image_urls": [],
+                    "meta": meta,
+                }
             meta = {
-                "type": "clarification",
-                "missing_case": "missing_table_chapter_context",
+                "type": "no_match",
+                "target": "table",
+                "reason": "table_chapter_ambiguous",
                 "model": settings.CHAT_MODEL,
-                "candidate_chapters": chapters,
                 "query_language": detected_language,
             }
             _attach_timing_meta(meta, timings, started_at)
             return {
-                "answer": f"{table_number}-jadval qaysi bo'lim/bob bo'yicha kerak?{chapter_hint}",
+                "answer": f"{table_number}-jadval bir nechta bo'limda uchraydi. SHNQ kodi bilan birga so'rang.",
                 "sources": [],
                 "table_html": None,
                 "image_urls": [],
@@ -1395,7 +1483,11 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         table_intent = _is_table_intent_query(query_text)
         numeric_requirement = _is_numeric_requirement_query(query_text)
         allow_table_search = table_intent or row_priority
-        soft_table_probe = (not allow_table_search) and numeric_requirement and clause_best_score < settings.RAG_MIN_SCORE
+        soft_table_probe = (
+            (not allow_table_search)
+            and numeric_requirement
+            and clause_best_score < settings.RAG_RICH_SOURCE_CLAUSE_THRESHOLD
+        )
 
         row_items: list[RetrievalItem] = []
         if allow_table_search or soft_table_probe:
@@ -1411,11 +1503,11 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                 limit_override=row_top_k,
             )
             if soft_table_probe:
-                strict_score = max(0.55, settings.RAG_TABLE_ROW_MIN_SCORE + 0.22)
+                strict_score = max(0.42, settings.RAG_TABLE_ROW_MIN_SCORE + 0.18)
                 row_items = [
                     item
                     for item in row_items
-                    if item.score >= strict_score and float(item.keyword_score or 0.0) >= 0.32
+                    if item.score >= strict_score and float(item.keyword_score or 0.0) >= 0.28
                 ]
             if allow_table_search and (row_priority or not row_items):
                 row_fallback = _search_table_row_keyword_fallback(
@@ -1465,22 +1557,29 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     if not requested_doc_code:
         ask_doc, docs = _should_ask_document_clarification(clause_items, best_score)
         if ask_doc:
-            title_by_code = _get_document_titles_by_code(db, docs)
-            meta = {
-                "type": "clarification",
-                "missing_case": "ambiguous_document",
-                "candidate_documents": docs,
-                "model": settings.CHAT_MODEL,
-                "query_language": detected_language,
-            }
-            _attach_timing_meta(meta, timings, started_at)
-            return {
-                "answer": _build_document_clarification_answer(docs, title_by_code),
-                "sources": [],
-                "table_html": None,
-                "image_urls": [],
-                "meta": meta,
-            }
+            if settings.RAG_ALLOW_DOCUMENT_SUGGESTIONS:
+                title_by_code = _get_document_titles_by_code(db, docs)
+                meta = {
+                    "type": "clarification",
+                    "missing_case": "ambiguous_document",
+                    "candidate_documents": docs,
+                    "model": settings.CHAT_MODEL,
+                    "query_language": detected_language,
+                }
+                _attach_timing_meta(meta, timings, started_at)
+                return {
+                    "answer": _build_document_clarification_answer(docs, title_by_code),
+                    "sources": [],
+                    "table_html": None,
+                    "image_urls": [],
+                    "meta": meta,
+                }
+            top_doc = (clause_items[0].shnq_code or "").strip() if clause_items else ""
+            if top_doc:
+                clause_items = [item for item in clause_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
+                row_items = [item for item in row_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
+                image_items = [item for item in image_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
+                best_score = clause_items[0].score if clause_items else 0.0
 
     if _is_weak_clause_only_result(clause_items, row_items, image_items):
         if requested_doc_code:
@@ -1644,6 +1743,7 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         "translation_fallback_used": translation_fallback_used,
         "translation_fallback_threshold": settings.RAG_TRANSLATION_FALLBACK_THRESHOLD,
         "translated_query_score_weight": settings.RAG_TRANSLATED_QUERY_SCORE_WEIGHT,
+        "document_suggestions_enabled": settings.RAG_ALLOW_DOCUMENT_SUGGESTIONS,
         "fewshot_examples_used": len(fewshot_examples),
         "image_sources": len([i for i in merged if i.kind == "image"]),
         "table_row_sources": len([i for i in merged if i.kind == "table_row"]),
