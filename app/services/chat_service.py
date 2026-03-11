@@ -512,6 +512,8 @@ def _search_clause_candidates(db: Session, query: str, query_vec: list[float], d
     for item in fused:
         semantic = float(item.dense_score or 0.0)
         keyword = _keyword_score(terms, item.snippet)
+        if semantic < 0.02 and keyword < 0.16:
+            continue
         base_score = float(item.rerank_score or item.hybrid_score or item.dense_score or item.lexical_score or 0.0)
         if base_score <= 0:
             continue
@@ -924,8 +926,28 @@ def _should_ask_document_clarification(items: list[RetrievalItem], best_score: f
         return False, docs
     second_score = items[1].score
     close_scores = (best_score - second_score) <= settings.RAG_AMBIGUITY_SCORE_GAP
-    low_confidence = best_score < settings.RAG_STRICT_MIN_SCORE
-    return close_scores or low_confidence, docs
+    if not close_scores:
+        return False, docs
+
+    top_signal = max(float(items[0].semantic_score or 0.0), float(items[0].keyword_score or 0.0))
+    second_signal = max(float(items[1].semantic_score or 0.0), float(items[1].keyword_score or 0.0))
+    if top_signal < 0.22 or second_signal < 0.22:
+        return False, docs
+
+    # Past confidence holatida faqat haqiqatan bir nechta hujjatda kuchli signal bo'lsa clarification so'raymiz.
+    if best_score < settings.RAG_STRICT_MIN_SCORE:
+        strong_docs: set[str] = set()
+        for item in items[: max(2, settings.RAG_DOMINANCE_WINDOW)]:
+            if item.score < threshold:
+                continue
+            signal = max(float(item.semantic_score or 0.0), float(item.keyword_score or 0.0))
+            code = (item.shnq_code or "").strip().lower()
+            if code and signal >= max(0.24, settings.RAG_STRONG_KEYWORD_MIN * 0.8):
+                strong_docs.add(code)
+        if len(strong_docs) < 2:
+            return False, docs
+
+    return True, docs
 
 
 def _can_answer_with_relaxed_threshold(items: list[RetrievalItem], best_score: float) -> bool:
@@ -1303,17 +1325,24 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             if requested_doc_code:
                 raw_q = raw_q.filter(Clause.document.has(code=requested_doc_code))
             raw_rows = raw_q.order_by(Clause.order).limit(4000).all()
-            words = [w.lower() for w in query_text.split() if len(w) > 2]
+            words = _extract_query_terms(query_text)
             keyword_hits: list[RetrievalItem] = []
             for row in raw_rows:
                 text_l = (row.text or "").lower()
-                hit = sum(1 for w in words if w in text_l)
-                if hit <= 0:
+                if not words:
+                    break
+                tf = sum(text_l.count(w) for w in words)
+                coverage = sum(1 for w in words if w in text_l)
+                if coverage <= 0:
                     continue
+                if coverage == 1 and len(words) >= 4 and tf < 2:
+                    continue
+                keyword_ratio = coverage / max(len(words), 1)
+                score = (keyword_ratio * 0.75) + min(0.25, tf * 0.04)
                 keyword_hits.append(
                     RetrievalItem(
                         kind="clause",
-                        score=float(hit),
+                        score=float(score),
                         title=f"Band {row.clause_number or '-'}",
                         snippet=(row.text or "")[:900],
                         shnq_code=row.document.code if row.document else "",
@@ -1323,7 +1352,7 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                         chapter=row.chapter.title if row.chapter else None,
                         lex_url=row.document.lex_url if row.document else None,
                         semantic_score=0.0,
-                        keyword_score=float(hit),
+                        keyword_score=float(keyword_ratio),
                     )
                 )
             keyword_hits.sort(key=lambda x: x.score, reverse=True)
@@ -1544,6 +1573,7 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     rewritten_any = (rewritten_primary != primary_query_message) or (
         rewritten_secondary is not None and secondary_query_message is not None and rewritten_secondary != secondary_query_message
     )
+    top_clause = clause_items[0] if clause_items else None
     meta = {
         "type": "rag",
         "model": settings.CHAT_MODEL,
@@ -1573,6 +1603,16 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         "table_row_scan_limit": settings.RAG_TABLE_ROW_SCAN_LIMIT,
         "table_intent_row_top_k": settings.RAG_TABLE_INTENT_ROW_TOP_K,
         "rich_source_clause_threshold": settings.RAG_RICH_SOURCE_CLAUSE_THRESHOLD,
+        "retrieval_counts": {
+            "clause": len(clause_items),
+            "table_row": len(row_items),
+            "image": len(image_items),
+        },
+        "top_clause_signal": {
+            "semantic": round(float(top_clause.semantic_score or 0.0), 4) if top_clause else 0.0,
+            "keyword": round(float(top_clause.keyword_score or 0.0), 4) if top_clause else 0.0,
+            "doc": top_clause.shnq_code if top_clause else None,
+        },
         "best_score": round(best_score, 4),
         "qdrant_enabled": settings.RAG_USE_QDRANT,
         "llm_used": llm_used,
