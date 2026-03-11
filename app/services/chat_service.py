@@ -47,6 +47,10 @@ APPENDIX_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 TABLE_TYPO_RE = re.compile(r"\b(jadval|jadvl|jadvlda|jdval|table|ilova|appendix)\b", re.IGNORECASE)
+CLAUSE_LOOKUP_RE = re.compile(
+    r"(?:\b\d+\s*[-.]?\s*band(?:da|ni|ga|dan|ning|lar)?\b|\bband(?:da|ni|ga|dan|ning|lar)?\b|\bmodda\b)",
+    re.IGNORECASE,
+)
 GREETING_PATTERNS = [
     r"\bsalom\b",
     r"\bassalomu?\s+alaykum\b",
@@ -126,6 +130,31 @@ QUERY_STOPWORDS = {
     "snip",
     "larda",
     "larda?",
+}
+TABLE_CONTEXT_STOP_WORDS = {
+    "jadval",
+    "jadvlda",
+    "jadvl",
+    "jdval",
+    "table",
+    "ilova",
+    "appendix",
+    "haqida",
+    "malumot",
+    "ma'lumot",
+    "nima",
+    "deyilgan",
+    "ber",
+    "bering",
+    "korsat",
+    "ko'rsat",
+    "qaysi",
+    "boyicha",
+    "bo'yicha",
+    "shnq",
+    "qmq",
+    "kmk",
+    "snip",
 }
 APOSTROPHE_VARIANTS = str.maketrans({
     "`": "'",
@@ -269,6 +298,60 @@ def _table_query_terms(message: str) -> list[str]:
     return [term for term in terms if term not in generic]
 
 
+def _normalize_doc_code(text: str | None) -> str:
+    return re.sub(r"\s+", "", (text or "")).lower()
+
+
+def _extract_table_context_terms(message: str, doc_code: str | None, table_number: str | None) -> list[str]:
+    normalized = _normalize_text(message)
+    terms = re.findall(r"[^\W\d_]+(?:'[^\W\d_]+)?", normalized, flags=re.UNICODE)
+    doc_terms = set(re.findall(r"[^\W\d_]+(?:'[^\W\d_]+)?", _normalize_text(doc_code or ""), flags=re.UNICODE))
+    number = (table_number or "").lower()
+    cleaned: list[str] = []
+    for term in terms:
+        if len(term) < 3:
+            continue
+        if term in TABLE_CONTEXT_STOP_WORDS:
+            continue
+        if term in doc_terms:
+            continue
+        if number and term == number:
+            continue
+        cleaned.append(term)
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for term in cleaned:
+        if term in seen:
+            continue
+        seen.add(term)
+        uniq.append(term)
+    return uniq
+
+
+def _table_exact_section_hit(table: NormTable, normalized_message: str) -> bool:
+    section = _normalize_text(table.section_title or "")
+    if len(section) < 8:
+        return False
+    if section in normalized_message:
+        return True
+    section_core = re.sub(r"^\d+\s*[-.]?\s*(?:§|bob)?\.?\s*", "", section).strip()
+    return len(section_core) >= 8 and section_core in normalized_message
+
+
+def _table_context_score(table: NormTable, context_terms: list[str]) -> int:
+    if not context_terms:
+        return 0
+    haystack = _normalize_text(
+        f"{table.document.code if table.document else ''} "
+        f"{table.section_title or ''} "
+        f"{table.chapter.title if table.chapter else ''} "
+        f"{table.title or ''} "
+        f"{(table.markdown or '')[:2500]} "
+        f"{(table.raw_html or '')[:2500]}"
+    )
+    return sum(1 for term in context_terms if term in haystack)
+
+
 def _score_table_candidate(message: str, table_number: str, table: NormTable) -> float:
     terms = _table_query_terms(message)
     title_text = " | ".join(
@@ -311,6 +394,10 @@ def _is_table_direct_lookup_request(message: str) -> bool:
     return not any(hint in normalized for hint in TABLE_QUESTION_HINTS)
 
 
+def _is_explicit_clause_lookup(text: str) -> bool:
+    return bool(CLAUSE_LOOKUP_RE.search(text or ""))
+
+
 def _build_table_answer(table: NormTable) -> str:
     chapter_title = table.section_title or (table.chapter.title if table.chapter else "-")
     return f"{table.document.code if table.document else ''} bo'yicha {table.table_number} topildi ({chapter_title})."
@@ -326,37 +413,31 @@ def _find_tables_by_reference(
         return []
 
     query = db.query(NormTable).options(joinedload(NormTable.document), joinedload(NormTable.chapter))
-    doc_key = re.sub(r"\s+", "", (doc_code or "")).lower()
+    doc_key = _normalize_doc_code(doc_code)
 
-    exact_candidates = query.filter(or_(*[NormTable.table_number.ilike(variant) for variant in variants])).all()
-    exact_candidates = [item for item in exact_candidates if _match_table_number(item.table_number, table_number)]
+    candidate_pool = query.filter(or_(*[NormTable.table_number.ilike(variant) for variant in variants])).all()
+    candidate_pool = [item for item in candidate_pool if _match_table_number(item.table_number, table_number)]
 
-    candidate_pool: list[NormTable]
-    if exact_candidates:
-        candidate_pool = exact_candidates
-    else:
-        # Fallback: only consider rows where explicit "N-jadval" mention exists.
-        seed = variants[0].split(".")[0] if variants else table_number
-        broad = query.filter(
-            or_(
-                NormTable.title.ilike(f"%{seed}%"),
-                NormTable.markdown.ilike(f"%{seed}%"),
-                NormTable.raw_html.ilike(f"%{seed}%"),
-            )
-        ).limit(2000).all()
+    if not candidate_pool and table_number.startswith("ilova-"):
+        appendix_number = table_number.split("-", 1)[1]
+        key_variants = {f"{appendix_number}-ilova", f"{appendix_number} ilova"}
+        fallback_rows = query.limit(3000).all()
         candidate_pool = [
             item
-            for item in broad
-            if _table_reference_in_text(item.table_number, table_number)
-            or _table_reference_in_text(item.title, table_number)
-            or _table_reference_in_text(item.markdown, table_number)
-            or _table_reference_in_text(item.raw_html, table_number)
+            for item in fallback_rows
+            if any(
+                key in _normalize_text(
+                    f"{item.section_title or ''} {item.title or ''} {(item.markdown or '')[:1200]}"
+                )
+                for key in key_variants
+            )
         ]
+
     if doc_key:
         candidate_pool = [
             item
             for item in candidate_pool
-            if item.document and doc_key in re.sub(r"\s+", "", (item.document.code or "")).lower()
+            if item.document and doc_key in _normalize_doc_code(item.document.code)
         ]
 
     unique: list[NormTable] = []
@@ -385,18 +466,45 @@ def _find_table_for_query(
     candidates = _find_tables_by_reference(db, table_number, doc_code)
     if not candidates:
         return None, table_number, doc_code, []
+
+    normalized_message = _normalize_text(message)
+    context_terms = _extract_table_context_terms(message, doc_code, table_number)
+    if context_terms:
+        exact_matches = [item for item in candidates if _table_exact_section_hit(item, normalized_message)]
+        if exact_matches:
+            section_keys = {
+                _normalize_text(item.section_title or (item.chapter.title if item.chapter else ""))
+                for item in exact_matches
+            }
+            if len(section_keys) == 1:
+                picked = sorted(exact_matches, key=lambda x: x.order)[0]
+                return picked, table_number, doc_code, candidates
+
+        scored = sorted(
+            candidates,
+            key=lambda item: (
+                1 if _table_exact_section_hit(item, normalized_message) else 0,
+                _table_context_score(item, context_terms),
+                -int(item.order or 0),
+            ),
+            reverse=True,
+        )
+        best = scored[0]
+        best_exact = _table_exact_section_hit(best, normalized_message)
+        second_exact = _table_exact_section_hit(scored[1], normalized_message) if len(scored) > 1 else False
+        best_score = _table_context_score(best, context_terms)
+        second_score = _table_context_score(scored[1], context_terms) if len(scored) > 1 else -1
+
+        if best_exact and not second_exact:
+            return best, table_number, doc_code, candidates
+        if best_score > 0 and best_score > second_score:
+            return best, table_number, doc_code, candidates
+        if len(scored) == 1:
+            return scored[0], table_number, doc_code, candidates
+        return None, table_number, doc_code, scored
+
     if len(candidates) == 1:
         return candidates[0], table_number, doc_code, candidates
-    scored = sorted(
-        [(_score_table_candidate(message, table_number, item), item) for item in candidates],
-        key=lambda x: x[0],
-        reverse=True,
-    )
-    top_score = scored[0][0]
-    second_score = scored[1][0] if len(scored) > 1 else 0.0
-    confident = top_score >= 0.72 and (top_score - second_score) >= 0.12
-    if confident:
-        return scored[0][1], table_number, doc_code, candidates
     return None, table_number, doc_code, candidates
 
 
@@ -1481,11 +1589,13 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         normalized_query = _normalize_text(query_text)
         row_priority = _is_table_row_priority_query(query_text)
         table_intent = _is_table_intent_query(query_text)
+        explicit_clause_lookup = _is_explicit_clause_lookup(query_text)
         numeric_requirement = _is_numeric_requirement_query(query_text)
-        allow_table_search = table_intent or row_priority
+        allow_table_search = (table_intent or row_priority) and not explicit_clause_lookup
         soft_table_probe = (
             (not allow_table_search)
             and numeric_requirement
+            and (not explicit_clause_lookup)
             and clause_best_score < settings.RAG_RICH_SOURCE_CLAUSE_THRESHOLD
         )
 
