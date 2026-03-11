@@ -131,6 +131,24 @@ QUERY_STOPWORDS = {
     "larda",
     "larda?",
 }
+SPECIFICITY_STOPWORDS = {
+    "minimal",
+    "maksimal",
+    "kamida",
+    "ko'pi",
+    "foiz",
+    "ulush",
+    "qancha",
+    "necha",
+    "kerak",
+    "talab",
+    "norma",
+    "me'yor",
+    "meyor",
+    "hujjat",
+    "band",
+    "bob",
+}
 TABLE_CONTEXT_STOP_WORDS = {
     "jadval",
     "jadvlda",
@@ -671,6 +689,20 @@ def _extract_query_terms(text: str) -> list[str]:
     return list(dict.fromkeys(out))[:8]
 
 
+def _query_specific_terms(text: str) -> list[str]:
+    terms = _extract_query_terms(text)
+    specific = [
+        term
+        for term in terms
+        if len(term) >= 7 and term not in SPECIFICITY_STOPWORDS
+    ]
+    if specific:
+        return specific[:4]
+    # fallback: if no long terms, still keep 1-2 less-generic terms
+    secondary = [term for term in terms if term not in SPECIFICITY_STOPWORDS]
+    return secondary[:2]
+
+
 def _keyword_score(terms: list[str], text: str) -> float:
     haystack = _normalize_text(text)
     if not terms or not haystack:
@@ -686,6 +718,7 @@ def _clause_confidence_weight(semantic: float, keyword: float) -> float:
 
 def _search_clause_candidates(db: Session, query: str, query_vec: list[float], doc_code: str | None) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
+    specific_terms = _query_specific_terms(query)
     dense = retrieve_dense_clauses(db=db, query_vec=query_vec, document_code=doc_code, limit=settings.RAG_DENSE_K)
     if not dense:
         dense = retrieve_db_dense_fallback(db=db, query_vec=query_vec, document_code=doc_code, limit=settings.RAG_DENSE_K)
@@ -696,6 +729,10 @@ def _search_clause_candidates(db: Session, query: str, query_vec: list[float], d
     for item in fused:
         semantic = float(item.dense_score or 0.0)
         keyword = _keyword_score(terms, item.snippet)
+        specific_keyword = _keyword_score(specific_terms, item.snippet) if specific_terms else 0.0
+        if specific_terms and specific_keyword <= 0 and semantic < 0.18:
+            continue
+        keyword = max(keyword, specific_keyword)
         if semantic < 0.02 and keyword < 0.16:
             continue
         base_score = float(item.rerank_score or item.hybrid_score or item.dense_score or item.lexical_score or 0.0)
@@ -726,6 +763,7 @@ def _search_table_row_candidates(
     limit_override: int | None = None,
 ) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
+    specific_terms = _query_specific_terms(query)
     if not terms and not row_priority:
         return []
     normalized_query = _normalize_text(query)
@@ -762,13 +800,18 @@ def _search_table_row_candidates(
         normalized_row = _normalize_text(combined_text)
         semantic = _cosine(query_vec, emb.vector or [])
         keyword = _keyword_score(terms, normalized_row)
+        specific_keyword = _keyword_score(specific_terms, normalized_row) if specific_terms else 0.0
+        keyword = max(keyword, specific_keyword)
         tf = sum(normalized_row.count(term) for term in terms)
         coverage = sum(1 for term in terms if term in normalized_row)
+        specific_coverage = sum(1 for term in specific_terms if term in normalized_row) if specific_terms else 0
         phrase_bonus = 0.35 if normalized_query and normalized_query in normalized_row else 0.0
         focus_bonus = 0.12 if row_priority and coverage >= 2 else 0.0
         score = (semantic * 0.85) + (keyword * 0.6) + min(0.35, tf * 0.06) + phrase_bonus + focus_bonus
 
         # Row-priority querylarda lexical moslik yetarli bo'lsa semantic past bo'lsa ham o'tkazamiz.
+        if specific_terms and specific_coverage == 0 and semantic < 0.2 and not row_priority:
+            continue
         if not row_priority and score < settings.RAG_TABLE_ROW_MIN_SCORE and keyword <= 0:
             continue
         if row_priority and coverage == 0 and semantic < settings.RAG_TABLE_ROW_MIN_SCORE:
@@ -1363,6 +1406,14 @@ def _select_context_items(query: str, items: list[RetrievalItem]) -> list[Retrie
         return items[:6]
     if not row_priority:
         clause_items = [item for item in items if item.kind == "clause"]
+        row_items = [item for item in items if item.kind == "table_row"]
+        if _is_numeric_requirement_query(query) and row_items:
+            top_clause = clause_items[0].score if clause_items else 0.0
+            top_row = row_items[0].score
+            if top_row >= (top_clause + 0.06):
+                selected = [*row_items[:3], *clause_items[:3]]
+                selected.sort(key=lambda x: x.score, reverse=True)
+                return selected[:6]
         if clause_items:
             return clause_items[:6]
         image_items = [item for item in items if item.kind == "image"]
