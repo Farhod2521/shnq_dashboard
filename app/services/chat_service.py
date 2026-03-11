@@ -1399,6 +1399,14 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
 
     fewshot_examples = _pick_fewshot_examples(original_message, limit=3)
     system, prompt = _build_rag_prompt(original_message, merged, response_language=detected_language, fewshot_examples=fewshot_examples)
+
+    # LLM chaqiruvi vaqtida DB connectionni band qilib turmaslik uchun
+    # read-only transactionni yakunlaymiz.
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
     llm_used = False
     llm_error: str | None = None
     llm_error_detail: str | None = None
