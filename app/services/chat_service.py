@@ -494,6 +494,12 @@ def _keyword_score(terms: list[str], text: str) -> float:
     return sum(1 for term in terms if term in haystack) / max(len(terms), 1)
 
 
+def _clause_confidence_weight(semantic: float, keyword: float) -> float:
+    quality = max(0.0, min(1.0, max(semantic, keyword)))
+    # Lexical-only weak matchesni pasaytirib, aniq dense yoki keyword moslikni ustun qilamiz.
+    return 0.35 + (0.65 * quality)
+
+
 def _search_clause_candidates(db: Session, query: str, query_vec: list[float], doc_code: str | None) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
     dense = retrieve_dense_clauses(db=db, query_vec=query_vec, document_code=doc_code, limit=settings.RAG_DENSE_K)
@@ -502,19 +508,27 @@ def _search_clause_candidates(db: Session, query: str, query_vec: list[float], d
     lexical = retrieve_lexical_clauses(db=db, query=query, document_code=doc_code, limit=settings.RAG_LEXICAL_K)
     fused = reciprocal_rank_fusion(dense, lexical, rrf_k=settings.RAG_RRF_K)
     fused = rerank_clauses(query, fused[: settings.RAG_RERANK_CANDIDATES], settings.RAG_TOP_K) if settings.RAG_ENABLE_RERANK else fused[: settings.RAG_TOP_K]
-    return [
-        RetrievalItem(
-            kind="clause",
-            score=item.rerank_score or item.hybrid_score or item.dense_score or item.lexical_score,
-            title=item.title,
-            snippet=item.snippet,
-            shnq_code=item.shnq_code,
-            clause_id=item.clause_id,
-            semantic_score=item.dense_score,
-            keyword_score=_keyword_score(terms, item.snippet),
+    out: list[RetrievalItem] = []
+    for item in fused:
+        semantic = float(item.dense_score or 0.0)
+        keyword = _keyword_score(terms, item.snippet)
+        base_score = float(item.rerank_score or item.hybrid_score or item.dense_score or item.lexical_score or 0.0)
+        if base_score <= 0:
+            continue
+        calibrated_score = base_score * _clause_confidence_weight(semantic, keyword)
+        out.append(
+            RetrievalItem(
+                kind="clause",
+                score=calibrated_score,
+                title=item.title,
+                snippet=item.snippet,
+                shnq_code=item.shnq_code,
+                clause_id=item.clause_id,
+                semantic_score=semantic,
+                keyword_score=keyword,
+            )
         )
-        for item in fused
-    ]
+    return out
 
 
 def _search_table_row_candidates(
@@ -928,6 +942,19 @@ def _can_answer_with_relaxed_threshold(items: list[RetrievalItem], best_score: f
     ratio = sum(1 for item in window if item.shnq_code == top_doc) / max(len(window), 1)
     top_keyword = window[0].keyword_score or 0.0
     return ratio >= settings.RAG_DOC_DOMINANCE_MIN_RATIO and top_keyword >= settings.RAG_STRONG_KEYWORD_MIN
+
+
+def _is_weak_clause_only_result(
+    clause_items: list[RetrievalItem],
+    row_items: list[RetrievalItem],
+    image_items: list[RetrievalItem],
+) -> bool:
+    if not clause_items or row_items or image_items:
+        return False
+    top = clause_items[0]
+    semantic = float(top.semantic_score or 0.0)
+    keyword = float(top.keyword_score or 0.0)
+    return semantic < 0.02 and keyword < 0.22
 
 
 def _get_document_titles_by_code(db: Session, docs: list[str]) -> dict[str, str]:
@@ -1376,6 +1403,20 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                 "image_urls": [],
                 "meta": meta,
             }
+
+    if _is_weak_clause_only_result(clause_items, row_items, image_items):
+        if requested_doc_code:
+            message_text = f"{requested_doc_code} bo'yicha savolga mos band aniq topilmadi."
+        else:
+            message_text = "Savolga mos band aniq topilmadi. Iltimos, SHNQ kodini yoki aniqroq iborani kiriting."
+        meta = {
+            "type": "no_match",
+            "reason": "weak_clause_match",
+            "model": settings.CHAT_MODEL,
+            "query_language": detected_language,
+        }
+        _attach_timing_meta(meta, timings, started_at)
+        return {"answer": message_text, "sources": [], "table_html": None, "image_urls": [], "meta": meta}
 
     relaxed = _can_answer_with_relaxed_threshold(clause_items, best_score)
     if best_score < settings.RAG_STRICT_MIN_SCORE and not (relaxed or row_items or image_items):

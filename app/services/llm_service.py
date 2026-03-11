@@ -277,8 +277,19 @@ def generate_text(
     model: str | None = None,
     options: dict | None = None,
 ) -> str:
+    selected_model = model or settings.CHAT_MODEL
+
+    def _prefers_max_completion_tokens(model_name: str) -> bool:
+        name = (model_name or "").strip().lower()
+        return (
+            name.startswith("gpt-5")
+            or name.startswith("o1")
+            or name.startswith("o3")
+            or name.startswith("o4")
+        )
+
     req = {
-        "model": model or settings.CHAT_MODEL,
+        "model": selected_model,
         "messages": [],
         "stream": False,
     }
@@ -286,10 +297,31 @@ def generate_text(
         req["messages"].append({"role": "system", "content": system})
     req["messages"].append({"role": "user", "content": prompt})
     if options:
-        for key in ("temperature", "top_p", "max_tokens"):
+        for key in ("temperature", "top_p"):
             if key in options:
                 req[key] = options[key]
-    response = _get_openai_client().chat.completions.create(**req)
+        if "max_completion_tokens" in options and options["max_completion_tokens"] is not None:
+            req["max_completion_tokens"] = options["max_completion_tokens"]
+        elif "max_tokens" in options and options["max_tokens"] is not None:
+            token_key = "max_completion_tokens" if _prefers_max_completion_tokens(selected_model) else "max_tokens"
+            req[token_key] = options["max_tokens"]
+
+    try:
+        response = _get_openai_client().chat.completions.create(**req)
+    except Exception as exc:
+        # Some newer models reject max_tokens and require max_completion_tokens.
+        error_text = (str(exc) or "").lower()
+        needs_retry_with_completion_tokens = (
+            "max_tokens" in req
+            and "max_completion_tokens" not in req
+            and "max_completion_tokens" in error_text
+        )
+        if not needs_retry_with_completion_tokens:
+            raise
+        retry_req = dict(req)
+        retry_req["max_completion_tokens"] = retry_req.pop("max_tokens")
+        response = _get_openai_client().chat.completions.create(**retry_req)
+
     if not response.choices:
         return ""
     message = response.choices[0].message

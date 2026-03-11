@@ -20,6 +20,12 @@ router = APIRouter()
 DOCUMENT_CODE_RE = re.compile(r"\b(shnq|qmq|kmk|snip)\s*([0-9][0-9.\-]*)\b", re.IGNORECASE)
 AMBIGUOUS_DOCUMENT_PROMPT = "savolda bir nechta hujjatda mos variant topildi"
 GUEST_LIMIT_ERROR_CODE = "guest_limit_reached"
+DOCUMENT_SELECTION_PROMPT_MARKERS = (
+    "aynan qaysi shnq",
+    "qaysi shnq nazarda",
+    "qaysi hujjat nazarda",
+    "quyidagi shnq hujjatlarida",
+)
 
 
 class ChatPingRequest(BaseModel):
@@ -142,8 +148,23 @@ def _looks_like_document_selection(message: str) -> bool:
     if token_count <= 8:
         return True
     lowered = text.lower()
-    selection_markers = ("shu", "tanla", "tanladim", "kerak", "mana")
+    selection_markers = ("shu", "tanla", "tanladim", "kerak", "mana", "yubor", "yuboryapman")
     return token_count <= 14 and any(marker in lowered for marker in selection_markers)
+
+
+def _is_document_clarification_message(text: str) -> bool:
+    normalized = " ".join((text or "").lower().split())
+    if not normalized:
+        return False
+    if AMBIGUOUS_DOCUMENT_PROMPT in normalized:
+        return True
+
+    codes = _extract_document_codes(normalized)
+    if len(codes) < 2:
+        return False
+    if any(marker in normalized for marker in DOCUMENT_SELECTION_PROMPT_MARKERS):
+        return True
+    return "\n1." in (text or "") or "\r\n1." in (text or "")
 
 
 def _resolve_followup_document_request(
@@ -175,7 +196,7 @@ def _resolve_followup_document_request(
     )
     if not last_assistant:
         return effective_message, effective_document_code, None
-    if AMBIGUOUS_DOCUMENT_PROMPT not in (last_assistant.content or "").lower():
+    if not _is_document_clarification_message(last_assistant.content or ""):
         return effective_message, effective_document_code, None
 
     candidate_codes = _extract_document_codes(last_assistant.content or "")
