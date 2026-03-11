@@ -2,7 +2,7 @@ import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
@@ -33,6 +33,13 @@ router = APIRouter()
 UPLOAD_BASE = os.path.join(os.getcwd(), "uploads")
 ORIGINAL_DIR = os.path.join(UPLOAD_BASE, "docs", "original")
 HTML_DIR = os.path.join(UPLOAD_BASE, "docs", "html")
+
+QUEUE_POLL_SECONDS = 3
+QUEUE_BATCH_LIMIT = 32
+
+_PIPELINE_WORKER_LOCK = threading.Lock()
+_PIPELINE_WORKER_STARTED = False
+_PIPELINE_WAKE_EVENT = threading.Event()
 
 
 class DocumentStageProgress(BaseModel):
@@ -325,6 +332,145 @@ def _run_pipeline_batch(document_ids: list[str], max_parallel: int | None = None
                 continue
 
 
+def _wake_pipeline_worker():
+    _PIPELINE_WAKE_EVENT.set()
+
+
+def _ensure_process_rows_for_missing_documents(db: Session, *, limit: int) -> int:
+    missing_docs = _collect_documents_without_process(db, limit=limit)
+    if not missing_docs:
+        return 0
+    for doc in missing_docs:
+        _set_process_queued(db, doc.id)
+    db.commit()
+    return len(missing_docs)
+
+
+def _recover_stale_processing_rows(db: Session, *, stale_after_minutes: int = 15, limit: int = 500) -> int:
+    threshold = datetime.utcnow() - timedelta(minutes=max(1, stale_after_minutes))
+    rows = (
+        db.query(DocumentProcess)
+        .filter(DocumentProcess.status == "processing", DocumentProcess.updated_at < threshold)
+        .order_by(DocumentProcess.updated_at.asc())
+        .limit(limit)
+        .all()
+    )
+    if not rows:
+        return 0
+
+    now = datetime.utcnow()
+    for row in rows:
+        row.status = "queued"
+        row.stage = "queued"
+        row.updated_at = now
+        db.add(row)
+    db.commit()
+    return len(rows)
+
+
+def _claim_queued_document_ids(*, limit: int) -> list[str]:
+    db = SessionLocal()
+    try:
+        _ensure_process_rows_for_missing_documents(db, limit=max(limit, QUEUE_BATCH_LIMIT))
+        rows = (
+            db.query(DocumentProcess)
+            .filter(DocumentProcess.status == "queued")
+            .order_by(DocumentProcess.updated_at.asc())
+            .limit(limit)
+            .all()
+        )
+        if not rows:
+            return []
+
+        now = datetime.utcnow()
+        out: list[str] = []
+        for row in rows:
+            row.status = "processing"
+            if not row.stage:
+                row.stage = "queued"
+            row.updated_at = now
+            db.add(row)
+            out.append(str(row.document_id))
+        db.commit()
+        return out
+    finally:
+        db.close()
+
+
+def _pipeline_worker_loop():
+    while True:
+        try:
+            batch_size = max(1, min(max(1, settings.PIPELINE_MAX_PARALLEL), QUEUE_BATCH_LIMIT))
+            document_ids = _claim_queued_document_ids(limit=batch_size)
+            if document_ids:
+                _run_pipeline_batch(document_ids, max_parallel=settings.PIPELINE_MAX_PARALLEL)
+                continue
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pipeline-worker] error: {exc}")
+        _PIPELINE_WAKE_EVENT.wait(timeout=QUEUE_POLL_SECONDS)
+        _PIPELINE_WAKE_EVENT.clear()
+
+
+def start_document_pipeline_worker(
+    *,
+    recover_failed: bool = False,
+    stale_after_minutes: int = 15,
+    recover_limit: int = 2000,
+) -> int:
+    global _PIPELINE_WORKER_STARTED
+    with _PIPELINE_WORKER_LOCK:
+        if not _PIPELINE_WORKER_STARTED:
+            thread = threading.Thread(
+                target=_pipeline_worker_loop,
+                daemon=True,
+                name="document-pipeline-worker",
+            )
+            thread.start()
+            _PIPELINE_WORKER_STARTED = True
+
+    db = SessionLocal()
+    try:
+        _recover_stale_processing_rows(
+            db,
+            stale_after_minutes=stale_after_minutes,
+            limit=recover_limit,
+        )
+        if recover_failed:
+            failed_rows = (
+                db.query(DocumentProcess)
+                .filter(DocumentProcess.status == "failed")
+                .order_by(DocumentProcess.updated_at.asc())
+                .limit(recover_limit)
+                .all()
+            )
+            for row in failed_rows:
+                row.status = "queued"
+                row.stage = "queued"
+                row.updated_at = datetime.utcnow()
+                db.add(row)
+            if failed_rows:
+                db.commit()
+        _ensure_process_rows_for_missing_documents(db, limit=recover_limit)
+
+        pending_process = (
+            db.query(func.count(DocumentProcess.id))
+            .filter(DocumentProcess.status.in_(["queued", "processing"]))
+            .scalar()
+            or 0
+        )
+        missing_process = (
+            db.query(func.count(Document.id))
+            .filter(~Document.id.in_(db.query(DocumentProcess.document_id)))
+            .scalar()
+            or 0
+        )
+    finally:
+        db.close()
+
+    _wake_pipeline_worker()
+    return int(pending_process + missing_process)
+
+
 def _collect_requeue_targets(
     db: Session,
     *,
@@ -400,36 +546,12 @@ def resume_document_pipelines_on_startup(
     limit: int = 500,
     max_parallel: int | None = None,
 ) -> int:
-    db = SessionLocal()
-    try:
-        process_rows = _collect_requeue_targets(
-            db,
-            include_failed=include_failed,
-            limit=limit,
-        )
-        document_ids = _requeue_process_rows(db, process_rows)
-        remaining = max(0, limit - len(document_ids))
-        if remaining > 0:
-            missing_docs = _collect_documents_without_process(db, limit=remaining)
-            for doc in missing_docs:
-                _set_process_queued(db, doc.id)
-                document_ids.append(str(doc.id))
-            if missing_docs:
-                db.commit()
-    finally:
-        db.close()
-
-    if not document_ids:
-        return 0
-
-    worker = threading.Thread(
-        target=_run_pipeline_batch,
-        args=(document_ids, max_parallel),
-        daemon=True,
-        name="document-pipeline-recovery",
+    _ = max_parallel  # backward compatibility
+    return start_document_pipeline_worker(
+        recover_failed=include_failed,
+        stale_after_minutes=15,
+        recover_limit=max(1, limit),
     )
-    worker.start()
-    return len(document_ids)
 
 
 def _to_list_item(document: Document, process: DocumentProcess | None) -> DocumentListItem:
@@ -666,7 +788,7 @@ def create_document(
     _set_process_queued(db, doc.id)
     db.commit()
 
-    background_tasks.add_task(run_document_pipeline, str(doc.id))
+    _wake_pipeline_worker()
 
     return DocumentCreateResponse(id=str(doc.id), code=doc.code, status="queued")
 
@@ -749,7 +871,7 @@ def update_document(
         _delete_upload_file(old_html)
 
     if should_reprocess:
-        background_tasks.add_task(run_document_pipeline, str(doc.id))
+        _wake_pipeline_worker()
 
     return DocumentCreateResponse(id=str(doc.id), code=doc.code, status=status)
 
@@ -787,8 +909,8 @@ def requeue_stuck_documents(
             documentIds=[],
         )
 
-    effective_parallel = None if max_parallel == 0 else max_parallel
-    background_tasks.add_task(_run_pipeline_batch, document_ids, effective_parallel)
+    _ = max_parallel  # worker settings orqali boshqariladi
+    _wake_pipeline_worker()
     return DocumentRequeueResponse(
         detail="Hujjatlar qayta navbatga qo'yildi va pipeline ishga tushirildi.",
         queuedCount=len(document_ids),

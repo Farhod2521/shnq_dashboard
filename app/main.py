@@ -4,7 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.shnq import router as shnq_router
-from app.api.upload import resume_document_pipelines_on_startup, router as upload_router
+from app.api.upload import (
+    resume_document_pipelines_on_startup,
+    router as upload_router,
+)
 from app.db.base import Base
 from app.db.schema_upgrade import ensure_section_category_schema
 from app.db.session import engine
