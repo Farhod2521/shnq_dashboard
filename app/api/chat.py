@@ -4,8 +4,10 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.dependency import get_db
 from app.models.chat_message import ChatMessage
 from app.models.chat_session import ChatSession
@@ -17,6 +19,7 @@ from app.services.chat_service import answer_message
 router = APIRouter()
 DOCUMENT_CODE_RE = re.compile(r"\b(shnq|qmq|kmk|snip)\s*([0-9][0-9.\-]*)\b", re.IGNORECASE)
 AMBIGUOUS_DOCUMENT_PROMPT = "savolda bir nechta hujjatda mos variant topildi"
+GUEST_LIMIT_ERROR_CODE = "guest_limit_reached"
 
 
 class ChatPingRequest(BaseModel):
@@ -244,6 +247,31 @@ def _check_session_access(
     raise HTTPException(status_code=403, detail="Ushbu sessiyaga ruxsat yo'q.")
 
 
+def _count_guest_questions(db: Session, room_id: str) -> int:
+    count = (
+        db.query(func.count(ChatMessage.id))
+        .join(ChatSession, ChatMessage.session_id == ChatSession.id)
+        .filter(
+            ChatSession.user_id.is_(None),
+            ChatSession.guest_room_id == room_id,
+            ChatMessage.role == "user",
+        )
+        .scalar()
+    )
+    return int(count or 0)
+
+
+def _raise_guest_limit(limit: int) -> None:
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": GUEST_LIMIT_ERROR_CODE,
+            "message": f"Mehmon sifatida {limit} ta savoldan keyin tizimga kirish talab qilinadi.",
+            "limit": limit,
+        },
+    )
+
+
 @router.post("/ping")
 def chat_ping(payload: ChatPingRequest):
     return {"reply": payload.message}
@@ -427,6 +455,12 @@ def chat_message(
                 db.add(session)
                 db.commit()
                 db.refresh(session)
+
+        if not user:
+            limit = max(1, int(settings.CHAT_GUEST_MESSAGE_LIMIT))
+            guest_room = session.guest_room_id if session else None
+            if guest_room and _count_guest_questions(db, guest_room) >= limit:
+                _raise_guest_limit(limit)
 
         effective_message, effective_document_code, followup_meta = _resolve_followup_document_request(
             db=db,

@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+psycopg2://postgres:password@localhost:5432/shnq_ai"
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     CHAT_MODEL: str = "gpt-4o-mini"
+    CHAT_GUEST_MESSAGE_LIMIT: int = 3
     OPENAI_API_KEY: str | None = None
     DEEPSEEK_API_KEY: str | None = None
     OPENAI_BASE_URL: str | None = None
