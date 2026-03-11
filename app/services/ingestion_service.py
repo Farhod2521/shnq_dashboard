@@ -22,6 +22,7 @@ from app.models.norm_table_row import NormTableRow
 from app.models.table_row_embedding import TableRowEmbedding
 from app.services.llm_service import embed_text
 from app.services.qdrant_service import upsert_clause_embedding
+from app.utils.text_fix import repair_mojibake
 
 
 MIN_TEXT_LEN = 30
@@ -38,7 +39,8 @@ APPENDIX_NUMBER_PATTERN = re.compile(
 
 
 def clean_text(text: str | None) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip()
+    repaired = repair_mojibake(text or "")
+    return re.sub(r"\s+", " ", repaired).strip()
 
 
 def extract_clause_number(text: str) -> str | None:
@@ -396,8 +398,9 @@ def run_document_pipeline(document_id: str):
         if not html_path or not os.path.exists(html_path):
             raise RuntimeError("HTML fayl topilmadi. Avval HTML fayl yuklang.")
 
-        with open(html_path, "r", encoding="utf-8") as f:
-            soup = BeautifulSoup(f.read(), "html.parser")
+        with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
+            html_text = repair_mojibake(f.read())
+            soup = BeautifulSoup(html_text, "html.parser")
 
         inferred_code = extract_doc_code_from_html(soup)
         if inferred_code and inferred_code != document.code:

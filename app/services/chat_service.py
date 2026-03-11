@@ -25,6 +25,7 @@ from app.models.table_row_embedding import TableRowEmbedding
 from app.rag.hybrid_search import reciprocal_rank_fusion
 from app.rag.re_ranker import rerank_clauses
 from app.rag.retriever import retrieve_db_dense_fallback, retrieve_dense_clauses, retrieve_lexical_clauses
+from app.utils.text_fix import repair_mojibake, to_cp1251_mojibake
 from app.services.llm_service import (
     detect_query_language,
     embed_text,
@@ -215,7 +216,8 @@ class RetrievalItem:
 
 
 def _normalize_text(text: str) -> str:
-    lowered = unicodedata.normalize("NFKC", (text or "")).strip().lower()
+    repaired = repair_mojibake(text or "")
+    lowered = unicodedata.normalize("NFKC", repaired).strip().lower()
     lowered = lowered.translate(APOSTROPHE_VARIANTS)
     return re.sub(r"\s+", " ", lowered)
 
@@ -502,6 +504,7 @@ def _find_table_for_query(
             candidates,
             key=lambda item: (
                 1 if _table_exact_section_hit(item, normalized_message) else 0,
+                _score_table_candidate(message, table_number, item),
                 _table_context_score(item, context_terms),
                 -int(item.order or 0),
             ),
@@ -510,12 +513,16 @@ def _find_table_for_query(
         best = scored[0]
         best_exact = _table_exact_section_hit(best, normalized_message)
         second_exact = _table_exact_section_hit(scored[1], normalized_message) if len(scored) > 1 else False
-        best_score = _table_context_score(best, context_terms)
-        second_score = _table_context_score(scored[1], context_terms) if len(scored) > 1 else -1
+        best_context_score = _table_context_score(best, context_terms)
+        second_context_score = _table_context_score(scored[1], context_terms) if len(scored) > 1 else -1
+        best_candidate_score = _score_table_candidate(message, table_number, best)
+        second_candidate_score = _score_table_candidate(message, table_number, scored[1]) if len(scored) > 1 else -1.0
 
         if best_exact and not second_exact:
             return best, table_number, doc_code, candidates
-        if best_score > 0 and best_score > second_score:
+        if best_context_score > 0 and best_context_score > second_context_score:
+            return best, table_number, doc_code, candidates
+        if best_candidate_score >= 0.75 and best_candidate_score >= (second_candidate_score + 0.08):
             return best, table_number, doc_code, candidates
         if len(scored) == 1:
             return scored[0], table_number, doc_code, candidates
@@ -777,7 +784,14 @@ def _search_table_row_candidates(
     effective_top_k = max(1, int(limit_override or settings.RAG_TABLE_ROW_TOP_K))
     scan_limit = max(settings.RAG_TABLE_ROW_SCAN_LIMIT, effective_top_k * 60)
     if terms:
-        filters = [TableRowEmbedding.search_text.ilike(f"%{term}%") for term in terms[:4]]
+        filter_terms: list[str] = []
+        for term in terms[:4]:
+            if term and term not in filter_terms:
+                filter_terms.append(term)
+            mojibake_term = to_cp1251_mojibake(term)
+            if mojibake_term and mojibake_term != term and mojibake_term not in filter_terms:
+                filter_terms.append(mojibake_term)
+        filters = [TableRowEmbedding.search_text.ilike(f"%{term}%") for term in filter_terms]
         candidates = db_q.filter(or_(*filters)).limit(scan_limit).all()
         if not candidates:
             # Query lexical termlari embedding search_textda topilmasa ham
@@ -846,7 +860,14 @@ def _search_table_row_keyword_fallback(
     if not terms:
         return []
 
-    filters = [NormTableCell.text.ilike(f"%{term}%") for term in terms[:6]]
+    filter_terms: list[str] = []
+    for term in terms[:6]:
+        if term and term not in filter_terms:
+            filter_terms.append(term)
+        mojibake_term = to_cp1251_mojibake(term)
+        if mojibake_term and mojibake_term != term and mojibake_term not in filter_terms:
+            filter_terms.append(mojibake_term)
+    filters = [NormTableCell.text.ilike(f"%{term}%") for term in filter_terms]
     db_q = (
         db.query(NormTableCell, NormTableRow, NormTable)
         .join(NormTableRow, NormTableCell.row_id == NormTableRow.id)
@@ -1606,7 +1627,7 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             words = _extract_query_terms(query_text)
             keyword_hits: list[RetrievalItem] = []
             for row in raw_rows:
-                text_l = (row.text or "").lower()
+                text_l = _normalize_text(row.text or "")
                 if not words:
                     break
                 tf = sum(text_l.count(w) for w in words)

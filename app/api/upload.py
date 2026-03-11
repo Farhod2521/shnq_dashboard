@@ -329,11 +329,14 @@ def _collect_requeue_targets(
     db: Session,
     *,
     include_failed: bool = False,
+    include_done: bool = False,
     limit: int = 500,
 ) -> list[DocumentProcess]:
     statuses = ["queued", "processing"]
     if include_failed:
         statuses.append("failed")
+    if include_done:
+        statuses.append("done")
     return (
         db.query(DocumentProcess)
         .filter(DocumentProcess.status.in_(statuses))
@@ -734,6 +737,7 @@ def update_document(
 def requeue_stuck_documents(
     background_tasks: BackgroundTasks,
     include_failed: bool = Query(default=False),
+    include_done: bool = Query(default=False),
     limit: int = Query(default=500, ge=1, le=5000),
     max_parallel: int = Query(default=0, ge=0, le=128),
     db: Session = Depends(get_db),
@@ -741,6 +745,7 @@ def requeue_stuck_documents(
     process_rows = _collect_requeue_targets(
         db,
         include_failed=include_failed,
+        include_done=include_done,
         limit=limit,
     )
     document_ids = _requeue_process_rows(db, process_rows)

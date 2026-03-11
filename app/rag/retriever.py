@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.models.clause import Clause
 from app.models.clause_embedding import ClauseEmbedding
 from app.services.qdrant_service import search_clause_ids
+from app.utils.text_fix import repair_mojibake, to_cp1251_mojibake
 
 
 WORD_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF']+")
@@ -31,7 +32,8 @@ class RetrievedClause:
 def _tokenize(text: str) -> list[str]:
     if not text:
         return []
-    return [w.lower() for w in WORD_RE.findall(text) if len(w) > 2]
+    normalized = repair_mojibake(text)
+    return [w.lower() for w in WORD_RE.findall(normalized) if len(w) > 2]
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -94,20 +96,43 @@ def retrieve_lexical_clauses(
         return []
 
     unique_terms = list(dict.fromkeys(terms))[:8]
-    ilike_filters = [Clause.text.ilike(f"%{term}%") for term in unique_terms]
+    mojibake_terms = [
+        variant
+        for variant in (to_cp1251_mojibake(term) for term in unique_terms)
+        if variant and variant not in unique_terms
+    ]
+    search_terms = list(dict.fromkeys([*unique_terms, *mojibake_terms]))
+    ilike_filters = [Clause.text.ilike(f"%{term}%") for term in search_terms]
 
     db_q = db.query(Clause).options(joinedload(Clause.document))
     if document_code:
         db_q = db_q.filter(Clause.document.has(code=document_code))
-    db_q = db_q.filter(or_(*ilike_filters)).limit(max(limit * 8, 80))
+    db_q = db_q.filter(or_(*ilike_filters)).limit(max(limit * 12, 120))
 
     rows = db_q.all()
+    if len(rows) < max(24, limit * 3):
+        broad_q = db.query(Clause).options(joinedload(Clause.document))
+        if document_code:
+            broad_q = broad_q.filter(Clause.document.has(code=document_code))
+        fallback_rows = broad_q.limit(max(limit * 60, 2400)).all()
+        row_map = {str(row.id): row for row in rows}
+        for row in fallback_rows:
+            row_map.setdefault(str(row.id), row)
+        rows = list(row_map.values())
+
     results: list[RetrievedClause] = []
     for row in rows:
         text = row.text or ""
-        text_l = text.lower()
-        tf = sum(text_l.count(term) for term in unique_terms)
-        coverage = sum(1 for term in unique_terms if term in text_l)
+        text_fixed = repair_mojibake(text).lower()
+        text_raw = text.lower()
+
+        tf_clean = sum(text_fixed.count(term) for term in unique_terms)
+        coverage_clean = sum(1 for term in unique_terms if term in text_fixed)
+        tf_mojibake = sum(text_raw.count(term) for term in mojibake_terms)
+        coverage_mojibake = sum(1 for term in mojibake_terms if term in text_raw)
+
+        tf = max(tf_clean, tf_mojibake)
+        coverage = max(coverage_clean, coverage_mojibake)
         if tf <= 0:
             continue
         score = (coverage * 1.5) + math.log1p(tf)
@@ -143,6 +168,8 @@ def retrieve_db_dense_fallback(
     results: list[RetrievedClause] = []
     for emb in rows:
         if not emb.clause:
+            continue
+        if not emb.vector or len(emb.vector) != len(query_vec):
             continue
         score = _cosine(query_vec, emb.vector or [])
         results.append(
