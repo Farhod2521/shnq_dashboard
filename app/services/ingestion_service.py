@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 import uuid
 from datetime import datetime
 
@@ -24,6 +25,7 @@ from app.services.qdrant_service import upsert_clause_embedding
 
 
 MIN_TEXT_LEN = 30
+PIPELINE_SLOT_SEMAPHORE = threading.BoundedSemaphore(max(1, settings.PIPELINE_MAX_PARALLEL))
 TABLE_NUMBER_PATTERNS = [
     re.compile(r"\bjadval\s*[-.]?\s*([0-9]+[a-z]?)\b", re.IGNORECASE),
     re.compile(r"\b([0-9]+[a-z]?)\s*[-.]?\s*jadval\b", re.IGNORECASE),
@@ -365,6 +367,11 @@ def _build_row_search_text(row: NormTableRow) -> str:
 
 
 def run_document_pipeline(document_id: str):
+    acquired = False
+    db = None
+    # Parallel pipeline sonini global cheklab, DB pool bosimini tushiramiz.
+    PIPELINE_SLOT_SEMAPHORE.acquire()
+    acquired = True
     db = SessionLocal()
     try:
         doc_id = uuid.UUID(document_id)
@@ -620,8 +627,9 @@ def run_document_pipeline(document_id: str):
                 row_embedding=round((idx / total_rows) * 100),
                 commit=False,
             )
-            if idx % 20 == 0 or idx == total_rows:
-                db.commit()
+            # Embedding navbatida connectionni uzoq ushlab turmaslik uchun
+            # har iteratsiyada transactionni yakunlaymiz.
+            db.commit()
 
         _touch_process(db, process, stage="img_embedding", img_embedding=0)
         images = db.query(NormImage).filter(NormImage.document_id == doc_id).order_by(NormImage.order).all()
@@ -668,8 +676,9 @@ def run_document_pipeline(document_id: str):
                 img_embedding=round((idx / total_images) * 100),
                 commit=False,
             )
-            if idx % 10 == 0 or idx == total_images:
-                db.commit()
+            # Uzoq davom etadigan bosqichlarda pool bo'sh turishi uchun
+            # har iteratsiyada commit qilamiz.
+            db.commit()
 
         process.finished_at = datetime.utcnow()
         _touch_process(
@@ -713,6 +722,8 @@ def run_document_pipeline(document_id: str):
                             lex_url=document.lex_url,
                         )
                     )
+                # DB transactionni tez yakunlab, connectionni poolga qaytaramiz.
+                db.commit()
                 upsert_clause_embedding(
                     clause_id=str(clause.id),
                     vector=vector,
@@ -720,9 +731,6 @@ def run_document_pipeline(document_id: str):
                     clause_number=clause.clause_number,
                     chapter_title=chapter_title,
                 )
-                if idx % 20 == 0:
-                    db.commit()
-            db.commit()
         except Exception:
             db.rollback()
     except Exception as exc:  # noqa: BLE001
@@ -752,4 +760,7 @@ def run_document_pipeline(document_id: str):
                     pass
         print(f"[pipeline] document_id={document_id} failed: {exc}")
     finally:
-        db.close()
+        if db is not None:
+            db.close()
+        if acquired:
+            PIPELINE_SLOT_SEMAPHORE.release()
