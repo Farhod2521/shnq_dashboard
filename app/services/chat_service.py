@@ -7,6 +7,7 @@ import math
 import re
 import time
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,10 +15,13 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import settings
+from app.models.category import Category
 from app.models.clause import Clause
+from app.models.chapter import Chapter
 from app.models.document import Document
 from app.models.image_embedding import ImageEmbedding
 from app.models.norm_image import NormImage
+from app.models.section import Section
 from app.models.norm_table import NormTable
 from app.models.norm_table_cell import NormTableCell
 from app.models.norm_table_row import NormTableRow
@@ -199,6 +203,15 @@ CLARIFICATION_RULES = [
 
 _FEWSHOT_CACHE: list[dict[str, str]] | None = None
 _FEWSHOT_VECTOR_CACHE: list[tuple[dict[str, str], list[float]]] | None = None
+
+
+@dataclass
+class ChatQueryFilters:
+    section_ids: list[str] | None = None
+    category_ids: list[str] | None = None
+    document_codes: list[str] | None = None
+    chapter_ids: list[str] | None = None
+    chapter_titles: list[str] | None = None
 
 
 @dataclass
@@ -663,6 +676,101 @@ def _build_metadata_filters(
     elif intent.intent == "exact_band_reference":
         filters.content_types = ["clause"]
     return filters.normalized()
+
+
+def _normalize_uuid_list(values: list[str] | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        candidate = (value or "").strip()
+        if not candidate:
+            continue
+        try:
+            normalized = str(uuid.UUID(candidate))
+        except Exception:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def _normalize_string_list(values: list[str] | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        candidate = (value or "").strip()
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
+def _resolve_filtered_scope(
+    db: Session,
+    user_filters: ChatQueryFilters | None,
+) -> tuple[list[str], MetadataFilters, dict[str, object]]:
+    if not user_filters:
+        return [], MetadataFilters(), {"active": False}
+
+    section_ids = _normalize_uuid_list(user_filters.section_ids)
+    category_ids = _normalize_uuid_list(user_filters.category_ids)
+    chapter_ids = _normalize_uuid_list(user_filters.chapter_ids)
+    chapter_titles = _normalize_string_list(user_filters.chapter_titles)
+    explicit_doc_codes = _normalize_string_list(user_filters.document_codes)
+
+    codes: list[str] = []
+    if explicit_doc_codes:
+        codes.extend(explicit_doc_codes)
+
+    if category_ids:
+        rows = db.query(Document.code).filter(Document.category_id.in_(category_ids)).all()
+        codes.extend([row.code for row in rows if row.code])
+
+    if section_ids:
+        rows = (
+            db.query(Document.code)
+            .join(Category, Document.category_id == Category.id)
+            .join(Section, Category.section_id == Section.id)
+            .filter(Section.id.in_(section_ids))
+            .all()
+        )
+        codes.extend([row.code for row in rows if row.code])
+
+    if chapter_ids:
+        rows = db.query(Document.code).join(Chapter, Chapter.document_id == Document.id).filter(Chapter.id.in_(chapter_ids)).all()
+        codes.extend([row.code for row in rows if row.code])
+
+    if chapter_titles:
+        rows = (
+            db.query(Document.code)
+            .join(Chapter, Chapter.document_id == Document.id)
+            .filter(or_(*[Chapter.title.ilike(f"%{title}%") for title in chapter_titles]))
+            .all()
+        )
+        codes.extend([row.code for row in rows if row.code])
+
+    normalized_codes = _normalize_string_list(codes)
+    metadata = MetadataFilters(
+        document_codes=normalized_codes,
+        section_ids=chapter_ids,
+        section_titles=chapter_titles,
+    ).normalized()
+
+    debug = {
+        "active": bool(section_ids or category_ids or explicit_doc_codes or chapter_ids or chapter_titles),
+        "section_ids": section_ids,
+        "category_ids": category_ids,
+        "document_codes": normalized_codes,
+        "chapter_ids": chapter_ids,
+        "chapter_titles": chapter_titles,
+    }
+    return normalized_codes, metadata, debug
 
 
 def _search_exact_clause_references(
@@ -1175,6 +1283,17 @@ def _empty_answer_text(response_language: str = "uz") -> str:
     return "Kontekstda aniq javob topilmadi."
 
 
+def _no_answer_with_filter_hint(filters_active: bool, fallback: str | None = None) -> str:
+    if filters_active:
+        return "Tanlangan filter bo'yicha mos ma'lumot topilmadi. Filterni kengaytirib qayta urinib ko'ring."
+    base = (fallback or "").strip()
+    if base:
+        if base[-1] not in {".", "!", "?"}:
+            base = f"{base}."
+        return f"{base} Savolni aniqroq yozing yoki chat filterlaridan foydalaning."
+    return "Men bu bo'yicha ma'lumot topolmadim. Savolni aniqroq yozing yoki chat filterlaridan foydalaning."
+
+
 def _cleanup_answer_format(answer: str, response_language: str = "uz") -> str:
     text = (answer or "").strip()
     if not text:
@@ -1641,7 +1760,12 @@ def _select_context_items(query: str, items: list[RetrievalItem]) -> list[Retrie
     return selected[:6]
 
 
-def answer_message(db: Session, message: str, document_code: str | None = None) -> dict:
+def answer_message(
+    db: Session,
+    message: str,
+    document_code: str | None = None,
+    query_filters: ChatQueryFilters | None = None,
+) -> dict:
     started_at = time.perf_counter()
     timings = {"detect": 0.0, "translate_in": 0.0, "embed": 0.0, "rag_generate": 0.0, "translate_out": 0.0}
 
@@ -1676,6 +1800,35 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     requested_doc_code = document_code or _extract_doc_code(original_message) or _extract_doc_code(search_message)
     exact_reference = parse_exact_references(search_message)
     intent_result = classify_query_intent(search_message, exact_reference)
+    filtered_doc_codes, filtered_metadata, filter_debug = _resolve_filtered_scope(db, query_filters)
+    filters_active = bool(filter_debug.get("active"))
+    has_filter_input = bool(
+        query_filters
+        and (
+            (query_filters.section_ids or [])
+            or (query_filters.category_ids or [])
+            or (query_filters.document_codes or [])
+            or (query_filters.chapter_ids or [])
+            or (query_filters.chapter_titles or [])
+        )
+    )
+    if filters_active and has_filter_input and not filtered_doc_codes:
+        meta = {
+            "type": "no_match",
+            "reason": "filter_scope_empty",
+            "filters_active": True,
+            "filters": filter_debug,
+            "model": settings.CHAT_MODEL,
+            "query_language": detected_language,
+        }
+        _attach_timing_meta(meta, timings, started_at)
+        return {
+            "answer": _no_answer_with_filter_hint(True),
+            "sources": [],
+            "table_html": None,
+            "image_urls": [],
+            "meta": meta,
+        }
     _log_debug(
         "intent_selected",
         intent=intent_result.intent,
@@ -1683,16 +1836,33 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         reason=intent_result.reason,
         reference=intent_result.reference.to_debug_dict(),
         requested_doc_code=requested_doc_code,
+        filter_debug=filter_debug,
     )
 
     if _is_table_request(search_message) or intent_result.intent == "table_lookup":
         table, table_number, doc_code, candidates = _find_table_for_query(db, search_message, requested_doc_code)
+        if filtered_doc_codes:
+            allowed_doc_codes = {_normalize_doc_code(code) for code in filtered_doc_codes if code}
+            candidates = [
+                item
+                for item in candidates
+                if item.document and _normalize_doc_code(item.document.code if item.document else "") in allowed_doc_codes
+            ]
+            if table and (
+                not table.document or _normalize_doc_code(table.document.code if table.document else "") not in allowed_doc_codes
+            ):
+                table = None
+            if doc_code and _normalize_doc_code(doc_code) not in allowed_doc_codes:
+                doc_code = None
         if not table_number:
             meta = {"type": "clarification", "missing_case": "missing_table_number", "model": settings.CHAT_MODEL, "query_language": detected_language}
             _attach_timing_meta(meta, timings, started_at)
             return {"answer": "Qaysi jadval nazarda tutilmoqda? (masalan: 9-jadval)", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
         if not doc_code:
             docs = _table_candidate_docs(db, table_number)
+            if filtered_doc_codes:
+                allowed_doc_codes = {_normalize_doc_code(code) for code in filtered_doc_codes if code}
+                docs = [code for code in docs if _normalize_doc_code(code) in allowed_doc_codes]
             if table and table.document and table.document.code:
                 doc_code = table.document.code
             elif len(docs) == 1 and table:
@@ -1723,8 +1893,11 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                     "query_language": detected_language,
                 }
                 _attach_timing_meta(meta, timings, started_at)
+                answer_text = f"{table_number}-jadval bo'yicha aniq hujjat topilmadi. Iltimos, SHNQ kodini ham yozing (masalan: SHNQ 2.01.05-24)."
+                if filters_active:
+                    answer_text = _no_answer_with_filter_hint(True)
                 return {
-                    "answer": f"{table_number}-jadval bo'yicha aniq hujjat topilmadi. Iltimos, SHNQ kodini ham yozing (masalan: SHNQ 2.01.05-24).",
+                    "answer": answer_text,
                     "sources": [],
                     "table_html": None,
                     "image_urls": [],
@@ -1757,8 +1930,11 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                 "query_language": detected_language,
             }
             _attach_timing_meta(meta, timings, started_at)
+            answer_text = f"{table_number}-jadval bir nechta bo'limda uchraydi. SHNQ kodi bilan birga so'rang."
+            if filters_active:
+                answer_text = _no_answer_with_filter_hint(True)
             return {
-                "answer": f"{table_number}-jadval bir nechta bo'limda uchraydi. SHNQ kodi bilan birga so'rang.",
+                "answer": answer_text,
                 "sources": [],
                 "table_html": None,
                 "image_urls": [],
@@ -1768,7 +1944,13 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             doc_label = doc_code or "ko'rsatilgan hujjat"
             meta = {"type": "no_match", "target": "table", "model": settings.CHAT_MODEL, "query_language": detected_language}
             _attach_timing_meta(meta, timings, started_at)
-            return {"answer": f"{doc_label} bo'yicha {table_number}-jadval topilmadi.", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
+            return {
+                "answer": _no_answer_with_filter_hint(filters_active, fallback=f"{doc_label} bo'yicha {table_number}-jadval topilmadi"),
+                "sources": [],
+                "table_html": None,
+                "image_urls": [],
+                "meta": meta,
+            }
 
         if _is_table_direct_lookup_request(search_message):
             answer = _build_table_answer(table)
@@ -1800,6 +1982,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             "table_prelocalized": _has_pretranslated_table_content(table, detected_language),
             "intent": intent_result.intent,
             "exact_reference": exact_reference.to_debug_dict(),
+            "filters_active": filters_active,
+            "filters": filter_debug,
         }
         _attach_timing_meta(meta, timings, started_at)
         return {"answer": answer, "sources": [source], "table_html": table_html, "image_urls": [], "meta": meta}
@@ -1825,10 +2009,17 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             query=query_text,
             query_vec=query_vec,
             requested_doc_code=requested_doc_code,
-            explicit_doc_codes=exact_reference.document_codes,
+            explicit_doc_codes=[*filtered_doc_codes, *exact_reference.document_codes],
         )
         selected_doc_codes = route_result.document_codes
         metadata_filters = _build_metadata_filters(intent_result, exact_reference, selected_doc_codes)
+        if filtered_metadata.section_ids:
+            metadata_filters.section_ids = _normalize_string_list([*(metadata_filters.section_ids or []), *filtered_metadata.section_ids])
+        if filtered_metadata.section_titles:
+            metadata_filters.section_titles = _normalize_string_list([*(metadata_filters.section_titles or []), *filtered_metadata.section_titles])
+        if filtered_metadata.document_codes:
+            metadata_filters.document_codes = _normalize_string_list([*(metadata_filters.document_codes or []), *filtered_metadata.document_codes])
+        metadata_filters = metadata_filters.normalized()
         _log_debug(
             "document_route",
             query=query_text,
@@ -1997,7 +2188,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         _log_debug("no_answer_trigger", reason="requested_document_no_items", requested_doc_code=requested_doc_code)
         meta = {"type": "no_match", "target": "document", "model": settings.CHAT_MODEL, "query_language": detected_language}
         _attach_timing_meta(meta, timings, started_at)
-        return {"answer": f"{requested_doc_code} bo'yicha mos band topilmadi.", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
+        answer_text = _no_answer_with_filter_hint(filters_active, fallback=f"{requested_doc_code} bo'yicha mos band topilmadi")
+        return {"answer": answer_text, "sources": [], "table_html": None, "image_urls": [], "meta": meta}
 
     best_score = clause_items[0].score if clause_items else 0.0
     if not requested_doc_code:
@@ -2032,10 +2224,12 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
 
     if _is_weak_clause_only_result(clause_items, row_items, image_items):
         _log_debug("no_answer_trigger", reason="weak_clause_only_result")
-        if requested_doc_code:
-            message_text = f"{requested_doc_code} bo'yicha savolga mos band aniq topilmadi."
-        else:
-            message_text = "Savolga mos band aniq topilmadi. Iltimos, SHNQ kodini yoki aniqroq iborani kiriting."
+        fallback = (
+            f"{requested_doc_code} bo'yicha savolga mos band aniq topilmadi"
+            if requested_doc_code
+            else "Savolga mos band aniq topilmadi"
+        )
+        message_text = _no_answer_with_filter_hint(filters_active, fallback=fallback)
         meta = {
             "type": "no_match",
             "reason": "weak_clause_match",
@@ -2056,7 +2250,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         meta = {"type": "no_match", "model": settings.CHAT_MODEL, "query_language": detected_language}
         _log_debug("no_answer_trigger", reason="best_score_below_strict_without_support", best_score=best_score)
         _attach_timing_meta(meta, timings, started_at)
-        return {"answer": "Mos band topilmadi.", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
+        no_match_text = _no_answer_with_filter_hint(filters_active, fallback="Mos band topilmadi")
+        return {"answer": no_match_text, "sources": [], "table_html": None, "image_urls": [], "meta": meta}
 
     all_candidates = [*clause_items, *row_items, *image_items]
     rerank_debug = {"before_count": len(all_candidates), "after_count": len(all_candidates), "removed_duplicates": 0}
@@ -2100,9 +2295,15 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     )
     _log_debug("confidence_assessed", confidence=confidence.to_dict())
     if confidence.no_answer and not (row_items or image_items) and not relaxed:
-        message_text = "Kontekstda yetarli ishonchli dalil topilmadi. Iltimos, savolni aniqroq yozing."
+        message_text = _no_answer_with_filter_hint(
+            filters_active,
+            fallback="Kontekstda yetarli ishonchli dalil topilmadi",
+        )
         if confidence.reason == "exact_clause_not_found" and exact_reference.clause_numbers:
-            message_text = f"{', '.join(exact_reference.clause_numbers)} band bo'yicha aniq moslik topilmadi."
+            message_text = _no_answer_with_filter_hint(
+                filters_active,
+                fallback=f"{', '.join(exact_reference.clause_numbers)} band bo'yicha aniq moslik topilmadi",
+            )
         meta = {
             "type": "no_match",
             "reason": confidence.reason,
@@ -2118,7 +2319,13 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     if not merged:
         meta = {"type": "no_match", "model": settings.CHAT_MODEL, "query_language": detected_language}
         _attach_timing_meta(meta, timings, started_at)
-        return {"answer": "Mos band topilmadi.", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
+        return {
+            "answer": _no_answer_with_filter_hint(filters_active, fallback="Mos band topilmadi"),
+            "sources": [],
+            "table_html": None,
+            "image_urls": [],
+            "meta": meta,
+        }
 
     fewshot_examples = _pick_fewshot_examples(original_message, limit=3)
     system, prompt = _build_rag_prompt(
@@ -2239,6 +2446,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         "embedding_model": settings.EMBEDDING_MODEL,
         "answer_language": detected_language,
         "query_language": detected_language,
+        "filters_active": filters_active,
+        "filters": filter_debug,
         "intent": intent_result.intent,
         "intent_confidence": round(intent_result.confidence, 4),
         "intent_reason": intent_result.reason,

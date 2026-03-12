@@ -3,17 +3,20 @@ import re
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import settings
 from app.db.dependency import get_db
+from app.models.category import Category
 from app.models.chat_message import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.chat_user import ChatUser
+from app.models.document import Document
+from app.models.section import Section
 from app.services.auth_service import extract_bearer_token, get_user_by_token
-from app.services.chat_service import answer_message
+from app.services.chat_service import ChatQueryFilters, answer_message
 
 
 router = APIRouter()
@@ -32,11 +35,52 @@ class ChatPingRequest(BaseModel):
     message: str = "ping"
 
 
+class ChatFilterSelection(BaseModel):
+    section_ids: list[str] = Field(default_factory=list)
+    category_ids: list[str] = Field(default_factory=list)
+    document_codes: list[str] = Field(default_factory=list)
+    chapter_ids: list[str] = Field(default_factory=list)
+    chapter_titles: list[str] = Field(default_factory=list)
+
+
 class ChatMessageRequest(BaseModel):
     message: str
     document_code: str | None = None
     session_id: str | None = None
     room_id: str | None = None
+    filters: ChatFilterSelection | None = None
+
+
+class ChatFilterChapterItem(BaseModel):
+    id: str
+    title: str
+    order: int
+
+
+class ChatFilterDocumentItem(BaseModel):
+    id: str
+    code: str
+    title: str
+    chapters: list[ChatFilterChapterItem]
+
+
+class ChatFilterCategoryItem(BaseModel):
+    id: str
+    code: str
+    name: str
+    documents: list[ChatFilterDocumentItem]
+
+
+class ChatFilterSectionItem(BaseModel):
+    id: str
+    code: str
+    name: str
+    categories: list[ChatFilterCategoryItem]
+
+
+class ChatFilterTreeResponse(BaseModel):
+    sections: list[ChatFilterSectionItem]
+    counts: dict[str, int]
 
 
 class ChatSessionCreateRequest(BaseModel):
@@ -303,6 +347,81 @@ def chat_ping_get():
     return {"reply": "pong"}
 
 
+@router.get("/filters", response_model=ChatFilterTreeResponse)
+def get_chat_filters(
+    db: Session = Depends(get_db),
+):
+    sections = (
+        db.query(Section)
+        .options(
+            selectinload(Section.categories)
+            .selectinload(Category.documents)
+            .selectinload(Document.chapters)
+        )
+        .order_by(Section.code.asc(), Section.name.asc())
+        .all()
+    )
+
+    out_sections: list[ChatFilterSectionItem] = []
+    category_count = 0
+    document_count = 0
+    chapter_count = 0
+    for section in sections:
+        section_categories: list[ChatFilterCategoryItem] = []
+        ordered_categories = sorted(section.categories or [], key=lambda x: (x.code or "", x.name or ""))
+        for category in ordered_categories:
+            category_count += 1
+            docs: list[ChatFilterDocumentItem] = []
+            ordered_documents = sorted(category.documents or [], key=lambda x: (x.code or "", x.title or ""))
+            for document in ordered_documents:
+                document_count += 1
+                chapters = sorted(document.chapters or [], key=lambda x: (x.order or 0, x.title or ""))
+                chapter_items: list[ChatFilterChapterItem] = []
+                for chapter in chapters:
+                    chapter_count += 1
+                    chapter_items.append(
+                        ChatFilterChapterItem(
+                            id=str(chapter.id),
+                            title=chapter.title,
+                            order=int(chapter.order or 0),
+                        )
+                    )
+                docs.append(
+                    ChatFilterDocumentItem(
+                        id=str(document.id),
+                        code=document.code,
+                        title=document.title,
+                        chapters=chapter_items,
+                    )
+                )
+            section_categories.append(
+                ChatFilterCategoryItem(
+                    id=str(category.id),
+                    code=category.code,
+                    name=category.name,
+                    documents=docs,
+                )
+            )
+        out_sections.append(
+            ChatFilterSectionItem(
+                id=str(section.id),
+                code=section.code,
+                name=section.name,
+                categories=section_categories,
+            )
+        )
+
+    return ChatFilterTreeResponse(
+        sections=out_sections,
+        counts={
+            "sections": len(out_sections),
+            "categories": category_count,
+            "documents": document_count,
+            "chapters": chapter_count,
+        },
+    )
+
+
 @router.get("/qa-history", response_model=list[QAHistoryItem])
 def list_qa_history(
     limit: int = Query(default=300, ge=1, le=2000),
@@ -477,11 +596,21 @@ def chat_message(
             user_message=payload.message,
             document_code=payload.document_code,
         )
+        resolved_filters = None
+        if payload.filters:
+            resolved_filters = ChatQueryFilters(
+                section_ids=payload.filters.section_ids,
+                category_ids=payload.filters.category_ids,
+                document_codes=payload.filters.document_codes,
+                chapter_ids=payload.filters.chapter_ids,
+                chapter_titles=payload.filters.chapter_titles,
+            )
 
         result = answer_message(
             db=db,
             message=effective_message,
             document_code=effective_document_code,
+            query_filters=resolved_filters,
         )
         if followup_meta:
             if not isinstance(result.get("meta"), dict):
