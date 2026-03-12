@@ -45,6 +45,7 @@ def assess_confidence(
     min_score: float,
     intent: IntentResult,
     reference: ExactReference,
+    numeric_signal: float = 0.0,
 ) -> ConfidenceResult:
     if not items:
         return ConfidenceResult(
@@ -59,7 +60,7 @@ def assess_confidence(
     top_score = _value(top, "score")
     top_sem = _value(top, "semantic_score")
     top_kw = _value(top, "keyword_score")
-    signal = max(top_score, top_sem, top_kw)
+    signal = max(top_score, top_sem, top_kw, float(numeric_signal or 0.0))
     top_doc = _text(top, "shnq_code").lower()
 
     conflicting = False
@@ -113,4 +114,3 @@ def assess_confidence(
         conflicting_evidence=conflicting,
         warning=warning,
     )
-

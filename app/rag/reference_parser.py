@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 
 DOCUMENT_CODE_RE = re.compile(r"\b(shnq|qmq|kmk|snip)\s*([0-9][0-9.\-]*)\b", re.IGNORECASE)
 CLAUSE_NUMBER_RE = re.compile(
-    r"(?:\b(?:band|modda)\s*[-.:]?\s*(\d+(?:\.\d+){0,3})\b|\b(\d+(?:\.\d+){1,3})\s*[-.:]?\s*(?:band|modda)\b)",
+    r"(?:\b(?:band|modda)(?:i|lar|da|ni|ga|dan|ning)?\s*[-.:]?\s*(\d+(?:\.\d+){0,3})\b|"
+    r"\b(\d+(?:\.\d+){0,3})\s*[-.:]?\s*(?:band|modda)(?:i|lar|da|ni|ga|dan|ning)?\b)",
     re.IGNORECASE,
 )
 BARE_CLAUSE_NUMBER_RE = re.compile(r"\b(\d+\.\d+(?:\.\d+){0,2})\b")

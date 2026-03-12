@@ -3,8 +3,14 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
+from typing import TYPE_CHECKING, Any
 
-from app.rag.retriever import RetrievedClause
+from app.rag.numeric_reasoner import parse_numeric_query, score_numeric_text
+
+if TYPE_CHECKING:
+    from app.rag.retriever import RetrievedClause
+else:
+    RetrievedClause = Any
 
 
 WORD_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF']+")
@@ -58,6 +64,8 @@ def rerank_clauses(
         items.sort(key=lambda x: x.rerank_score, reverse=True)
         return items[:limit]
 
+    numeric_profile = parse_numeric_query(query)
+
     for item in items:
         snippet_l = (item.snippet or "").lower()
         overlap = sum(1 for t in query_terms if t in snippet_l)
@@ -65,6 +73,12 @@ def rerank_clauses(
         exact_clause_boost = 0.0
         if item.clause_number and item.clause_number in query:
             exact_clause_boost = 0.12
+        numeric_bonus = 0.0
+        if numeric_profile.is_numeric_query:
+            numeric_match = score_numeric_text(numeric_profile, item.snippet or "")
+            numeric_bonus = numeric_match.score * 0.22
+            if numeric_match.score <= 0.01:
+                numeric_bonus -= 0.03
 
         item.rerank_score = (
             (item.hybrid_score * 0.52)
@@ -72,12 +86,14 @@ def rerank_clauses(
             + (item.lexical_score * 0.12)
             + (coverage * 0.12)
             + exact_clause_boost
+            + numeric_bonus
         )
         if overlap > 0:
             item.rerank_score += min(0.03, math.log1p(overlap) * 0.01)
         item.signals["overlap"] = float(overlap)
         item.signals["coverage"] = float(coverage)
         item.signals["exact_clause_boost"] = float(exact_clause_boost)
+        item.signals["numeric_bonus"] = float(max(0.0, numeric_bonus))
 
     items.sort(key=lambda x: x.rerank_score, reverse=True)
     deduped = _dedupe_items(items)

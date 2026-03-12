@@ -34,6 +34,11 @@ class ReferenceIntentTests(unittest.TestCase):
         intent = classify_query_intent(text, parse_exact_references(text))
         self.assertEqual(intent.intent, "table_lookup")
 
+    def test_numeric_query_flag(self) -> None:
+        text = "Evakuatsiya yo'lagi minimal kengligi qancha bo'lishi kerak?"
+        intent = classify_query_intent(text, parse_exact_references(text))
+        self.assertTrue(intent.numeric_query)
+
 
 if __name__ == "__main__":
     unittest.main()

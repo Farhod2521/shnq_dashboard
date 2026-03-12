@@ -31,6 +31,13 @@ from app.rag.confidence import assess_confidence
 from app.rag.document_router import route_documents
 from app.rag.hybrid_search import reciprocal_rank_fusion
 from app.rag.metadata_filter import MetadataFilters, match_item_filters
+from app.rag.numeric_reasoner import (
+    NumericQueryProfile,
+    format_numeric_evidence,
+    parse_numeric_query,
+    score_numeric_text,
+)
+from app.rag.query_expansion import expand_clause_discovery_queries
 from app.rag.query_intent import IntentResult, classify_query_intent
 from app.rag.reference_parser import ExactReference, extract_document_codes, parse_exact_references
 from app.rag.re_ranker import rerank_clauses
@@ -240,6 +247,8 @@ class RetrievalItem:
     row_index: int | None = None
     semantic_score: float | None = None
     keyword_score: float | None = None
+    numeric_score: float | None = None
+    numeric_evidence: str | None = None
 
 
 def _normalize_text(text: str) -> str:
@@ -645,7 +654,10 @@ def _is_table_intent_query(text: str) -> bool:
 
 def _is_numeric_requirement_query(text: str) -> bool:
     normalized = _normalize_text(text)
-    return any(token in normalized for token in NUMERIC_REQUIREMENT_HINTS)
+    if any(token in normalized for token in NUMERIC_REQUIREMENT_HINTS):
+        return True
+    profile = parse_numeric_query(normalized)
+    return profile.is_numeric_query
 
 
 def _extract_document_codes(text: str) -> list[str]:
@@ -663,7 +675,9 @@ def _build_metadata_filters(
     selected_doc_codes: list[str] | None = None,
 ) -> MetadataFilters:
     filters = MetadataFilters(
-        document_codes=[*reference.document_codes, *(selected_doc_codes or [])],
+        # Route qilingan hujjatlar retrieval scope sifatida ishlatiladi, metadata hard-filter emas.
+        # Aks holda noto'g'ri document routing bo'lsa butun qidiruv yopilib qoladi.
+        document_codes=reference.document_codes[:],
         clause_numbers=reference.clause_numbers[:],
         table_numbers=reference.table_numbers[:],
         appendix_numbers=reference.appendix_numbers[:],
@@ -911,16 +925,25 @@ def _search_clause_candidates(
     query_vec: list[float],
     doc_codes: list[str] | None,
     metadata_filters: MetadataFilters | None = None,
+    numeric_profile: NumericQueryProfile | None = None,
+    dense_k: int | None = None,
+    lexical_k: int | None = None,
+    rerank_candidates: int | None = None,
+    top_k: int | None = None,
 ) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
     specific_terms = _query_specific_terms(query)
+    effective_dense_k = max(1, int(dense_k or settings.RAG_DENSE_K))
+    effective_lexical_k = max(1, int(lexical_k or settings.RAG_LEXICAL_K))
+    effective_rerank_candidates = max(1, int(rerank_candidates or settings.RAG_RERANK_CANDIDATES))
+    effective_top_k = max(1, int(top_k or settings.RAG_TOP_K))
     dense = retrieve_dense_clauses(
         db=db,
         query_vec=query_vec,
         document_code=None,
         document_codes=doc_codes,
         metadata_filters=metadata_filters,
-        limit=settings.RAG_DENSE_K,
+        limit=effective_dense_k,
     )
     if not dense:
         dense = retrieve_db_dense_fallback(
@@ -929,7 +952,7 @@ def _search_clause_candidates(
             document_code=None,
             document_codes=doc_codes,
             metadata_filters=metadata_filters,
-            limit=settings.RAG_DENSE_K,
+            limit=effective_dense_k,
         )
     lexical = retrieve_lexical_clauses(
         db=db,
@@ -937,11 +960,16 @@ def _search_clause_candidates(
         document_code=None,
         document_codes=doc_codes,
         metadata_filters=metadata_filters,
-        limit=settings.RAG_LEXICAL_K,
+        limit=effective_lexical_k,
     )
     fused = reciprocal_rank_fusion(dense, lexical, rrf_k=settings.RAG_RRF_K)
-    fused = rerank_clauses(query, fused[: settings.RAG_RERANK_CANDIDATES], settings.RAG_TOP_K) if settings.RAG_ENABLE_RERANK else fused[: settings.RAG_TOP_K]
+    fused = (
+        rerank_clauses(query, fused[: effective_rerank_candidates], effective_top_k)
+        if settings.RAG_ENABLE_RERANK
+        else fused[:effective_top_k]
+    )
     out: list[RetrievalItem] = []
+    profile = numeric_profile if numeric_profile and numeric_profile.is_numeric_query else None
     for item in fused:
         semantic = float(item.dense_score or 0.0)
         keyword = _keyword_score(terms, item.snippet)
@@ -954,7 +982,17 @@ def _search_clause_candidates(
         base_score = float(item.rerank_score or item.hybrid_score or item.dense_score or item.lexical_score or 0.0)
         if base_score <= 0:
             continue
+        numeric_score = 0.0
+        numeric_evidence = None
+        if profile:
+            numeric_match = score_numeric_text(profile, item.snippet or "")
+            numeric_score = float(numeric_match.score)
+            numeric_evidence = format_numeric_evidence(numeric_match.best)
         calibrated_score = base_score * _clause_confidence_weight(semantic, keyword)
+        if profile:
+            calibrated_score += numeric_score * settings.RAG_NUMERIC_SCORE_WEIGHT
+            if numeric_score <= 0.01:
+                calibrated_score -= 0.02
         out.append(
             RetrievalItem(
                 kind="clause",
@@ -973,6 +1011,8 @@ def _search_clause_candidates(
                 chapter=item.section_title,
                 semantic_score=semantic,
                 keyword_score=keyword,
+                numeric_score=numeric_score,
+                numeric_evidence=numeric_evidence,
             )
         )
     return [item for item in out if match_item_filters(item, metadata_filters)]
@@ -986,6 +1026,7 @@ def _search_table_row_candidates(
     metadata_filters: MetadataFilters | None = None,
     row_priority: bool = False,
     limit_override: int | None = None,
+    numeric_profile: NumericQueryProfile | None = None,
 ) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
     specific_terms = _query_specific_terms(query)
@@ -1048,6 +1089,13 @@ def _search_table_row_candidates(
         phrase_bonus = 0.35 if normalized_query and normalized_query in normalized_row else 0.0
         focus_bonus = 0.12 if row_priority and coverage >= 2 else 0.0
         score = (semantic * 0.85) + (keyword * 0.6) + min(0.35, tf * 0.06) + phrase_bonus + focus_bonus
+        numeric_score = 0.0
+        numeric_evidence = None
+        if numeric_profile and numeric_profile.is_numeric_query:
+            numeric_match = score_numeric_text(numeric_profile, combined_text)
+            numeric_score = float(numeric_match.score)
+            numeric_evidence = format_numeric_evidence(numeric_match.best)
+            score += numeric_score * max(0.12, settings.RAG_NUMERIC_SCORE_WEIGHT * 0.85)
 
         # Row-priority querylarda lexical moslik yetarli bo'lsa semantic past bo'lsa ham o'tkazamiz.
         if specific_terms and specific_coverage == 0 and semantic < 0.2 and not row_priority:
@@ -1073,6 +1121,8 @@ def _search_table_row_candidates(
             row_index=emb.row_index,
             semantic_score=semantic,
             keyword_score=keyword,
+            numeric_score=numeric_score,
+            numeric_evidence=numeric_evidence,
         )
         if match_item_filters(item, metadata_filters):
             out.append(item)
@@ -1294,6 +1344,73 @@ def _no_answer_with_filter_hint(filters_active: bool, fallback: str | None = Non
     return "Men bu bo'yicha ma'lumot topolmadim. Savolni aniqroq yozing yoki chat filterlaridan foydalaning."
 
 
+def _looks_like_no_answer_text(text: str) -> bool:
+    normalized = _normalize_text(text or "")
+    return any(
+        marker in normalized
+        for marker in (
+            "topilmadi",
+            "aniq javob topilmadi",
+            "yetarli dalil topilmadi",
+            "no clear answer",
+        )
+    )
+
+
+def _extract_relevant_sentence(snippet: str, numeric_evidence: str | None) -> str:
+    text = repair_mojibake(snippet or "").strip()
+    if not text:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    target = (numeric_evidence or "").strip().lower()
+    if target:
+        for sentence in sentences:
+            if target in sentence.lower():
+                return sentence.strip()
+    return (sentences[0] if sentences else text).strip()
+
+
+def _build_direct_clause_answer(item: RetrievalItem, response_language: str = "uz") -> str:
+    evidence = item.numeric_evidence or ""
+    sentence = _extract_relevant_sentence(item.snippet or "", evidence)
+    doc = (item.shnq_code or "").strip() or "SHNQ"
+    clause = (item.clause_number or "").strip()
+    source_label = f"{doc}, {clause}-band" if clause else doc
+    if not sentence:
+        sentence = (item.snippet or "").strip()[:220]
+    detail = sentence or "Kontekstda normativ band topildi."
+    if not detail.endswith("."):
+        detail += "."
+    short = f"{evidence} ({source_label})." if evidence else f"{source_label} bo'yicha norma topildi."
+    detailed_label, short_label = _answer_labels(response_language)
+    return f"{detailed_label}: {detail}\n{short_label}: {short}"
+
+
+def _find_numeric_rescue_candidate(
+    query_profile: NumericQueryProfile,
+    items: list[RetrievalItem],
+) -> RetrievalItem | None:
+    if not query_profile.is_numeric_query:
+        return None
+    best_item: RetrievalItem | None = None
+    best_signal = 0.0
+    for item in items:
+        if item.kind not in {"clause", "table_row"}:
+            continue
+        if not (item.snippet or "").strip():
+            continue
+        numeric_match = score_numeric_text(query_profile, item.snippet or "")
+        if numeric_match.score <= settings.RAG_NUMERIC_RESCUE_MIN_SCORE:
+            continue
+        signal = float(item.score or 0.0) + (numeric_match.score * 0.35)
+        if signal > best_signal:
+            best_signal = signal
+            best_item = copy.deepcopy(item)
+            best_item.numeric_score = numeric_match.score
+            best_item.numeric_evidence = format_numeric_evidence(numeric_match.best)
+    return best_item
+
+
 def _cleanup_answer_format(answer: str, response_language: str = "uz") -> str:
     text = (answer or "").strip()
     if not text:
@@ -1339,6 +1456,7 @@ def _build_rag_prompt(
                         f"Hujjat: {item.shnq_code}",
                         f"Bob: {item.chapter or 'Nomalum bob'}",
                         f"Band: {item.clause_number or '-'}",
+                        f"Numeric dalil: {item.numeric_evidence or '-'}",
                         f"Matn: {(item.snippet or '')[:1200]}",
                     ]
                 )
@@ -1365,6 +1483,7 @@ def _build_rag_prompt(
                         f"Bo'lim: {item.chapter or 'Nomalum bob'}",
                         f"Jadval: {item.table_number or '-'}",
                         f"Satr: {item.row_index if item.row_index is not None else '-'}",
+                        f"Numeric dalil: {item.numeric_evidence or '-'}",
                         f"Matn: {(item.snippet or '')[:1200]}",
                     ]
                 )
@@ -1387,18 +1506,25 @@ def _build_rag_prompt(
         )
     if intent and intent.intent == "compare_documents":
         compare_instruction = " Taqqoslash savollarida har bir hujjat bo'yicha dalilni alohida ko'rsatib, farqini qisqa xulosa qiling."
+    numeric_instruction = (
+        " Numeric savollarda (minimal/maksimal/kamida/ko'pi bilan/qancha) kontekstdagi eng mos son+birlikni tanlang. "
+        "Agar bir nechta qiymat bo'lsa, savoldagi obyektga semantik jihatdan eng mos bandni tanlang va shu bandni ko'rsating."
+    )
     system = (
         "Siz SHNQ qurilish me'yorlari bo'yicha ekspert AI yordamchisiz.\n\n"
 
         "Qoidalar:\n"
         "1. Faqat berilgan kontekst asosida javob bering.\n"
         "2. Hech qachon kontekstda bo'lmagan norma yoki talabni o'ylab topmang.\n"
-        "3. Agar kontekstda aniq javob bo'lmasa 'kontekstda aniq javob topilmadi' deb yozing.\n"
-        "4. Javobda imkon qadar SHNQ hujjat kodi, bob va bandni ko'rsating.\n"
-        "5. Agar jadval ishlatilsa jadval raqami va satrni ko'rsating.\n"
-        "6. Javob texnik, aniq va ortiqcha umumiy gaplarsiz bo'lsin.\n"
-        "7. Qurilish me'yorlariga zid yoki taxminiy maslahat bermang.\n"
-        "8. Agar bir nechta manba bo'lsa, eng mosini tanlang va javobni aralashtirmang.\n\n"
+        "3. Agar kontekstda kamida bitta mos norma bo'lsa 'topilmadi' demang.\n"
+        "4. Faqat haqiqatan mos dalil bo'lmasa 'kontekstda aniq javob topilmadi' deb yozing.\n"
+        "5. Javobda eng mos SHNQ kodi va band raqamini ko'rsating.\n"
+        "6. Numeric savollarda qiymat va birlikni aynan (masalan: 0,8 m, 150 mm, 35%) yozing.\n"
+        "7. Agar bir nechta numeric qiymat bo'lsa, savolga eng yaqin dalilni birinchi bering, boshqalarini qisqa izohlang.\n"
+        "8. Agar jadval ishlatilsa jadval raqami va satrni ko'rsating.\n"
+        "9. Javob texnik, aniq va ortiqcha umumiy gaplarsiz bo'lsin.\n"
+        "10. Qurilish me'yorlariga zid yoki taxminiy maslahat bermang.\n"
+        "11. Agar bir nechta manba bo'lsa, eng mosini tanlang va javobni aralashtirmang.\n\n"
 
         "Javob formati:\n"
         "Batafsil qismida norma tushuntirilsin, kerak bo'lsa raqamlar yozilsin, manba sifatida SHNQ kodi va band ko'rsatilsin.\n"
@@ -1408,7 +1534,7 @@ def _build_rag_prompt(
         "Har bir manba alohida hujjatdan olingan.\n"
         "Eng mos manbani tanlab javob bering.\n\n"
 
-        f"{doc_list_instruction}{table_instruction}{compare_instruction}"
+        f"{doc_list_instruction}{table_instruction}{compare_instruction}{numeric_instruction}"
     )
     prompt = (
         f"Savol: {question}\n\nKontekst:\n{context}{fewshot_block}\n\n"
@@ -1508,7 +1634,8 @@ def _is_weak_clause_only_result(
     top = clause_items[0]
     semantic = float(top.semantic_score or 0.0)
     keyword = float(top.keyword_score or 0.0)
-    return semantic < 0.02 and keyword < 0.22
+    numeric = float(top.numeric_score or 0.0)
+    return semantic < 0.02 and keyword < 0.22 and numeric < 0.14
 
 
 def _get_document_titles_by_code(db: Session, docs: list[str]) -> dict[str, str]:
@@ -1609,6 +1736,8 @@ def _source_from_item(item: RetrievalItem) -> dict[str, object]:
             "score": round(item.score, 4),
             "semantic_score": round(item.semantic_score or 0.0, 4),
             "keyword_score": round(item.keyword_score or 0.0, 4),
+            "numeric_score": round(item.numeric_score or 0.0, 4),
+            "numeric_evidence": item.numeric_evidence,
         }
     if item.kind == "image":
         return {
@@ -1629,6 +1758,8 @@ def _source_from_item(item: RetrievalItem) -> dict[str, object]:
             "score": round(item.score, 4),
             "semantic_score": round(item.semantic_score or 0.0, 4),
             "keyword_score": round(item.keyword_score or 0.0, 4),
+            "numeric_score": round(item.numeric_score or 0.0, 4),
+            "numeric_evidence": item.numeric_evidence,
         }
     return {
         "type": "table_row",
@@ -1647,6 +1778,8 @@ def _source_from_item(item: RetrievalItem) -> dict[str, object]:
         "score": round(item.score, 4),
         "semantic_score": round(item.semantic_score or 0.0, 4),
         "keyword_score": round(item.keyword_score or 0.0, 4),
+        "numeric_score": round(item.numeric_score or 0.0, 4),
+        "numeric_evidence": item.numeric_evidence,
     }
 
 
@@ -1724,6 +1857,7 @@ def _select_context_items(query: str, items: list[RetrievalItem]) -> list[Retrie
         return []
     table_intent = _is_table_intent_query(query)
     row_priority = _is_table_row_priority_query(query)
+    numeric_profile = parse_numeric_query(query)
     if table_intent:
         row_items = [item for item in items if item.kind == "table_row"]
         other_items = [item for item in items if item.kind != "table_row"]
@@ -1735,6 +1869,12 @@ def _select_context_items(query: str, items: list[RetrievalItem]) -> list[Retrie
     if not row_priority:
         clause_items = [item for item in items if item.kind == "clause"]
         row_items = [item for item in items if item.kind == "table_row"]
+        if numeric_profile.is_numeric_query and clause_items:
+            clause_items = sorted(
+                clause_items,
+                key=lambda x: float(x.score or 0.0) + float(x.numeric_score or 0.0) * 0.35,
+                reverse=True,
+            )
         if _is_numeric_requirement_query(query) and row_items:
             top_clause = clause_items[0].score if clause_items else 0.0
             top_row = row_items[0].score
@@ -1981,6 +2121,7 @@ def answer_message(
             "query_language": detected_language,
             "table_prelocalized": _has_pretranslated_table_content(table, detected_language),
             "intent": intent_result.intent,
+            "numeric_query": intent_result.numeric_query,
             "exact_reference": exact_reference.to_debug_dict(),
             "filters_active": filters_active,
             "filters": filter_debug,
@@ -2001,9 +2142,16 @@ def answer_message(
     def compute_candidates(
         query_text: str,
     ) -> tuple[list[RetrievalItem], list[RetrievalItem], list[RetrievalItem], list[str], MetadataFilters, dict[str, object]]:
-        t_embed = time.perf_counter()
-        query_vec = embed_text(query_text)
-        timings["embed"] = round(timings["embed"] + ((time.perf_counter() - t_embed) * 1000), 2)
+        query_profile = parse_numeric_query(query_text)
+        query_expansions = expand_clause_discovery_queries(query_text, exact_reference, query_profile)
+
+        def _embed_for_query(text: str) -> list[float]:
+            t_embed = time.perf_counter()
+            vec = embed_text(text)
+            timings["embed"] = round(timings["embed"] + ((time.perf_counter() - t_embed) * 1000), 2)
+            return vec
+
+        query_vec = _embed_for_query(query_text)
         route_result = route_documents(
             db=db,
             query=query_text,
@@ -2025,6 +2173,8 @@ def answer_message(
             query=query_text,
             selected_doc_codes=selected_doc_codes,
             route_debug=route_result.debug,
+            numeric_query=query_profile.is_numeric_query,
+            numeric_comparator=query_profile.comparator,
             metadata_filters={
                 "document_codes": metadata_filters.document_codes,
                 "clause_numbers": metadata_filters.clause_numbers,
@@ -2048,9 +2198,11 @@ def answer_message(
             query_vec=query_vec,
             doc_codes=selected_doc_codes,
             metadata_filters=metadata_filters,
+            numeric_profile=query_profile,
         )
         if exact_clause_items:
-            clause_items = _merge_retrieval_candidates(exact_clause_items, clause_items, secondary_weight=0.96)
+            clause_items = _merge_retrieval_candidates(exact_clause_items, clause_items, secondary_weight=0.98)
+
         if not clause_items:
             raw_q = db.query(Clause).options(joinedload(Clause.document))
             if selected_doc_codes:
@@ -2073,6 +2225,8 @@ def answer_message(
                     continue
                 keyword_ratio = coverage / max(len(words), 1)
                 score = (keyword_ratio * 0.75) + min(0.25, tf * 0.04)
+                numeric_match = score_numeric_text(query_profile, row.text or "")
+                score += numeric_match.score * 0.2
                 keyword_hits.append(
                     RetrievalItem(
                         kind="clause",
@@ -2091,12 +2245,81 @@ def answer_message(
                         lex_url=row.document.lex_url if row.document else None,
                         semantic_score=0.0,
                         keyword_score=float(keyword_ratio),
+                        numeric_score=float(numeric_match.score),
+                        numeric_evidence=format_numeric_evidence(numeric_match.best),
                     )
                 )
             keyword_hits.sort(key=lambda x: x.score, reverse=True)
             clause_items = [item for item in keyword_hits if match_item_filters(item, metadata_filters)][: settings.RAG_TOP_K]
 
         clause_best_score = clause_items[0].score if clause_items else 0.0
+        deep_threshold = max(settings.RAG_STRICT_MIN_SCORE, settings.RAG_MIN_SCORE + 0.06)
+        should_run_deep_clause_discovery = (
+            not exact_reference.clause_numbers
+            and (not clause_items or clause_best_score < deep_threshold or len(clause_items) < 3)
+        )
+        deep_multiplier = max(1, int(settings.RAG_DEEP_CLAUSE_MULTIPLIER))
+        if should_run_deep_clause_discovery and settings.RAG_DEEP_CLAUSE_DISCOVERY:
+            deep_candidates: list[RetrievalItem] = []
+            for idx, expanded_query in enumerate(query_expansions[:4]):
+                expanded_vec = query_vec if idx == 0 else _embed_for_query(expanded_query)
+                try:
+                    scoped_items = _search_clause_candidates(
+                        db=db,
+                        query=expanded_query,
+                        query_vec=expanded_vec,
+                        doc_codes=selected_doc_codes,
+                        metadata_filters=metadata_filters,
+                        numeric_profile=query_profile,
+                        dense_k=max(settings.RAG_DENSE_K * deep_multiplier, settings.RAG_DENSE_K + 20),
+                        lexical_k=max(settings.RAG_LEXICAL_K * deep_multiplier, settings.RAG_LEXICAL_K + 20),
+                        rerank_candidates=max(settings.RAG_RERANK_CANDIDATES * deep_multiplier, settings.RAG_RERANK_CANDIDATES + 24),
+                        top_k=max(settings.RAG_TOP_K * deep_multiplier, settings.RAG_TOP_K + 6),
+                    )
+                except Exception as exc:
+                    _log_debug("deep_clause_scope_failed", query=expanded_query, error=f"{type(exc).__name__}: {exc}")
+                    continue
+                deep_candidates = _merge_retrieval_candidates(deep_candidates, scoped_items, secondary_weight=0.98)
+            if deep_candidates:
+                clause_items = _merge_retrieval_candidates(clause_items, deep_candidates, secondary_weight=1.03)
+                clause_best_score = clause_items[0].score if clause_items else 0.0
+                _log_debug("deep_clause_scope_merge", query=query_text, count=len(deep_candidates), top_score=round(clause_best_score, 4))
+
+        needs_global_discovery = (
+            (not requested_doc_code)
+            and (not exact_reference.document_codes)
+            and (not filtered_doc_codes)
+            and intent_result.intent in {"topical_search", "general_synthesis"}
+            and (not clause_items or clause_best_score < settings.RAG_STRICT_MIN_SCORE)
+        )
+        if needs_global_discovery and settings.RAG_DEEP_CLAUSE_DISCOVERY:
+            global_filters = copy.deepcopy(metadata_filters)
+            global_filters.document_codes = []
+            global_candidates: list[RetrievalItem] = []
+            for idx, expanded_query in enumerate(query_expansions[:3]):
+                expanded_vec = query_vec if idx == 0 else _embed_for_query(expanded_query)
+                try:
+                    global_items = _search_clause_candidates(
+                        db=db,
+                        query=expanded_query,
+                        query_vec=expanded_vec,
+                        doc_codes=None,
+                        metadata_filters=global_filters,
+                        numeric_profile=query_profile,
+                        dense_k=max(settings.RAG_DENSE_K * deep_multiplier, settings.RAG_DOC_ROUTE_DENSE_K),
+                        lexical_k=max(settings.RAG_LEXICAL_K * deep_multiplier, settings.RAG_DOC_ROUTE_DENSE_K),
+                        rerank_candidates=max(settings.RAG_RERANK_CANDIDATES * deep_multiplier, settings.RAG_RERANK_CANDIDATES + 30),
+                        top_k=max(settings.RAG_TOP_K * deep_multiplier, settings.RAG_TOP_K + 8),
+                    )
+                except Exception as exc:
+                    _log_debug("global_clause_discovery_failed", query=expanded_query, error=f"{type(exc).__name__}: {exc}")
+                    continue
+                global_candidates = _merge_retrieval_candidates(global_candidates, global_items, secondary_weight=0.96)
+            if global_candidates:
+                clause_items = _merge_retrieval_candidates(clause_items, global_candidates, secondary_weight=0.96)
+                clause_best_score = clause_items[0].score if clause_items else 0.0
+                _log_debug("global_clause_discovery_merge", query=query_text, count=len(global_candidates), top_score=round(clause_best_score, 4))
+
         normalized_query = _normalize_text(query_text)
         row_priority = _is_table_row_priority_query(query_text)
         table_intent = intent_result.intent == "table_lookup" or _is_table_intent_query(query_text)
@@ -2123,6 +2346,7 @@ def answer_message(
                 metadata_filters=metadata_filters,
                 row_priority=row_priority,
                 limit_override=row_top_k,
+                numeric_profile=query_profile,
             )
             if soft_table_probe:
                 strict_score = max(0.42, settings.RAG_TABLE_ROW_MIN_SCORE + 0.18)
@@ -2162,11 +2386,14 @@ def answer_message(
             table_row=len(row_items),
             image=len(image_items),
             top_clause_score=round(clause_best_score, 4),
+            numeric_query=query_profile.is_numeric_query,
+            query_expansions=query_expansions,
         )
         return clause_items, row_items, image_items, selected_doc_codes, metadata_filters, route_result.debug
 
     clause_items, row_items, image_items, selected_docs_primary, _metadata_filters_primary, route_debug_primary = compute_candidates(rewritten_primary)
     primary_best_score = clause_items[0].score if clause_items else 0.0
+    numeric_profile_primary = parse_numeric_query(search_message)
     can_try_translated_fallback = (
         secondary_query_message
         and secondary_query_message.strip()
@@ -2223,6 +2450,25 @@ def answer_message(
                     best_score = clause_items[0].score if clause_items else 0.0
 
     if _is_weak_clause_only_result(clause_items, row_items, image_items):
+        numeric_rescue = _find_numeric_rescue_candidate(numeric_profile_primary, clause_items)
+        if numeric_rescue:
+            _log_debug(
+                "numeric_rescue_applied",
+                stage="weak_clause_only",
+                clause_number=numeric_rescue.clause_number,
+                doc=numeric_rescue.shnq_code,
+                evidence=numeric_rescue.numeric_evidence,
+            )
+            answer_text = _build_direct_clause_answer(numeric_rescue, response_language=detected_language)
+            rescue_sources = [_source_from_item(numeric_rescue)]
+            meta = {
+                "type": "rag_rescue",
+                "reason": "numeric_evidence_rescue",
+                "model": settings.CHAT_MODEL,
+                "query_language": detected_language,
+            }
+            _attach_timing_meta(meta, timings, started_at)
+            return {"answer": answer_text, "sources": rescue_sources, "table_html": None, "image_urls": [], "meta": meta}
         _log_debug("no_answer_trigger", reason="weak_clause_only_result")
         fallback = (
             f"{requested_doc_code} bo'yicha savolga mos band aniq topilmadi"
@@ -2241,6 +2487,25 @@ def answer_message(
 
     relaxed = _can_answer_with_relaxed_threshold(clause_items, best_score)
     if best_score < settings.RAG_STRICT_MIN_SCORE and not (relaxed or row_items or image_items):
+        numeric_rescue = _find_numeric_rescue_candidate(numeric_profile_primary, clause_items)
+        if numeric_rescue:
+            _log_debug(
+                "numeric_rescue_applied",
+                stage="strict_threshold",
+                clause_number=numeric_rescue.clause_number,
+                doc=numeric_rescue.shnq_code,
+                evidence=numeric_rescue.numeric_evidence,
+            )
+            answer_text = _build_direct_clause_answer(numeric_rescue, response_language=detected_language)
+            rescue_sources = [_source_from_item(numeric_rescue)]
+            meta = {
+                "type": "rag_rescue",
+                "reason": "numeric_evidence_rescue",
+                "model": settings.CHAT_MODEL,
+                "query_language": detected_language,
+            }
+            _attach_timing_meta(meta, timings, started_at)
+            return {"answer": answer_text, "sources": rescue_sources, "table_html": None, "image_urls": [], "meta": meta}
         clarification = _needs_clarification(search_message)
         if clarification:
             code, question = clarification
@@ -2292,9 +2557,30 @@ def answer_message(
         min_score=settings.RAG_MIN_SCORE,
         intent=intent_result,
         reference=exact_reference,
+        numeric_signal=max([float(item.numeric_score or 0.0) for item in (merged_all if merged_all else clause_items)] or [0.0]),
     )
     _log_debug("confidence_assessed", confidence=confidence.to_dict())
     if confidence.no_answer and not (row_items or image_items) and not relaxed:
+        numeric_rescue = _find_numeric_rescue_candidate(numeric_profile_primary, merged_all if merged_all else clause_items)
+        if numeric_rescue:
+            _log_debug(
+                "numeric_rescue_applied",
+                stage="confidence_no_answer",
+                clause_number=numeric_rescue.clause_number,
+                doc=numeric_rescue.shnq_code,
+                evidence=numeric_rescue.numeric_evidence,
+            )
+            answer_text = _build_direct_clause_answer(numeric_rescue, response_language=detected_language)
+            rescue_sources = [_source_from_item(numeric_rescue)]
+            meta = {
+                "type": "rag_rescue",
+                "reason": "numeric_evidence_rescue",
+                "model": settings.CHAT_MODEL,
+                "query_language": detected_language,
+                "confidence": confidence.to_dict(),
+            }
+            _attach_timing_meta(meta, timings, started_at)
+            return {"answer": answer_text, "sources": rescue_sources, "table_html": None, "image_urls": [], "meta": meta}
         message_text = _no_answer_with_filter_hint(
             filters_active,
             fallback="Kontekstda yetarli ishonchli dalil topilmadi",
@@ -2388,6 +2674,18 @@ def answer_message(
             title_by_code = _get_document_titles_by_code(db, context_codes)
             answer = _build_document_list_answer(context_codes, detected_language, title_by_code)
 
+    if _looks_like_no_answer_text(answer):
+        numeric_rescue = _find_numeric_rescue_candidate(numeric_profile_primary, merged)
+        if numeric_rescue:
+            _log_debug(
+                "numeric_rescue_applied",
+                stage="llm_no_answer_text",
+                clause_number=numeric_rescue.clause_number,
+                doc=numeric_rescue.shnq_code,
+                evidence=numeric_rescue.numeric_evidence,
+            )
+            answer = _build_direct_clause_answer(numeric_rescue, response_language=detected_language)
+
     answer = _cleanup_answer_format(answer, response_language=detected_language)
     t_out = time.perf_counter()
     answer = ensure_answer_language(answer, detected_language)
@@ -2451,6 +2749,7 @@ def answer_message(
         "intent": intent_result.intent,
         "intent_confidence": round(intent_result.confidence, 4),
         "intent_reason": intent_result.reason,
+        "numeric_query": intent_result.numeric_query,
         "exact_reference": exact_reference.to_debug_dict(),
         "min_score": settings.RAG_MIN_SCORE,
         "strict_min_score": settings.RAG_STRICT_MIN_SCORE,
@@ -2488,7 +2787,9 @@ def answer_message(
         "top_clause_signal": {
             "semantic": round(float(top_clause.semantic_score or 0.0), 4) if top_clause else 0.0,
             "keyword": round(float(top_clause.keyword_score or 0.0), 4) if top_clause else 0.0,
+            "numeric": round(float(top_clause.numeric_score or 0.0), 4) if top_clause else 0.0,
             "doc": top_clause.shnq_code if top_clause else None,
+            "numeric_evidence": top_clause.numeric_evidence if top_clause else None,
         },
         "best_score": round(best_score, 4),
         "qdrant_enabled": settings.RAG_USE_QDRANT,

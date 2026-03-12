@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from app.rag.numeric_reasoner import parse_numeric_query, score_numeric_text
 from app.rag.query_intent import IntentResult
 from app.rag.reference_parser import ExactReference
 
@@ -57,6 +58,7 @@ def rerank_mixed_items(
         return [], UnifiedRerankDebug(before_count=0, after_count=0, removed_duplicates=0)
 
     query_terms = _tokenize(query)
+    numeric_profile = parse_numeric_query(query)
     reranked: list[Any] = []
     for item in items:
         base = float(_item_attr(item, "score", 0.0) or 0.0)
@@ -67,6 +69,11 @@ def rerank_mixed_items(
         semantic = float(_item_attr(item, "semantic_score", 0.0) or 0.0)
         keyword = float(_item_attr(item, "keyword_score", 0.0) or 0.0)
         score = base + (coverage * 0.17) + (semantic * 0.06) + (keyword * 0.08)
+        if numeric_profile.is_numeric_query and kind in {"clause", "table_row"}:
+            numeric = score_numeric_text(numeric_profile, snippet)
+            score += numeric.score * 0.2
+            if numeric.score <= 0.01:
+                score -= 0.03
 
         if intent.intent == "table_lookup" and kind == "table_row":
             score += 0.22
@@ -135,4 +142,3 @@ def rerank_mixed_items(
         after_count=len(out),
         removed_duplicates=duplicates,
     )
-

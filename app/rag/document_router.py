@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.document import Document
 from app.rag.reference_parser import extract_document_codes
-from app.rag.retriever import retrieve_dense_clauses
+from app.rag.retriever import RetrievedClause, retrieve_dense_clauses, retrieve_lexical_clauses
 
 
 WORD_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF']+")
@@ -41,6 +41,27 @@ def _extract_terms(text: str) -> list[str]:
 class DocumentRouteResult:
     document_codes: list[str]
     debug: dict[str, object]
+
+
+def _aggregate_doc_scores(items: list[RetrievedClause], field: str) -> dict[str, float]:
+    bucket: dict[str, list[float]] = {}
+    for item in items:
+        code = (item.shnq_code or "").strip()
+        if not code:
+            continue
+        score = float(getattr(item, field, 0.0) or 0.0)
+        if score <= 0:
+            continue
+        bucket.setdefault(code, []).append(score)
+
+    out: dict[str, float] = {}
+    for code, scores in bucket.items():
+        ranked = sorted(scores, reverse=True)
+        top = ranked[0]
+        mean_top = sum(ranked[:3]) / min(3, len(ranked))
+        # Hujjat ichida ko'p bo'lakli umumiy shovqinni emas, eng kuchli mos bandni ustun qo'yamiz.
+        out[code] = (top * 0.72) + (mean_top * 0.28)
+    return out
 
 
 def route_documents(
@@ -88,24 +109,42 @@ def route_documents(
         document_code=None,
         limit=max(settings.RAG_DENSE_K, settings.RAG_DOC_ROUTE_DENSE_K),
     )
-    for item in dense_hits:
-        code = (item.shnq_code or "").strip()
-        if not code:
-            continue
-        dense_scores[code] = dense_scores.get(code, 0.0) + float(item.dense_score or 0.0)
+    dense_scores = _aggregate_doc_scores(dense_hits, "dense_score")
+
+    lexical_scores_from_clauses: dict[str, float] = {}
+    lexical_hits = retrieve_lexical_clauses(
+        db=db,
+        query=query,
+        document_code=None,
+        limit=max(settings.RAG_DOC_ROUTE_DENSE_K, settings.RAG_LEXICAL_K),
+    )
+    lexical_scores_from_clauses = _aggregate_doc_scores(lexical_hits, "lexical_score")
 
     score_map: dict[str, float] = {}
     for code, score in dense_scores.items():
-        score_map[code] = score_map.get(code, 0.0) + (score * 0.7)
+        score_map[code] = score_map.get(code, 0.0) + (score * 0.78)
     for code, score in lexical_scores.items():
-        score_map[code] = score_map.get(code, 0.0) + (score * 0.6)
+        score_map[code] = score_map.get(code, 0.0) + (score * 0.35)
+    for code, score in lexical_scores_from_clauses.items():
+        score_map[code] = score_map.get(code, 0.0) + (score * 0.55)
 
     inferred_codes = extract_document_codes(query)
     for code in inferred_codes:
-        score_map[code] = score_map.get(code, 0.0) + 1.2
+        score_map[code] = score_map.get(code, 0.0) + 1.6
 
     ranked = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
     selected_codes = [code for code, score in ranked if score >= settings.RAG_DOC_ROUTE_MIN_SCORE][: settings.RAG_DOC_ROUTE_TOP_K]
+
+    # Noto'g'ri hujjatga qattiq yopishib qolmaslik uchun yaqin ikkinchi hujjatni ham qamrab olamiz.
+    if len(selected_codes) < settings.RAG_DOC_ROUTE_TOP_K and ranked:
+        top_score = ranked[0][1]
+        for code, score in ranked:
+            if code in selected_codes:
+                continue
+            if score >= max(settings.RAG_DOC_ROUTE_MIN_SCORE * 0.92, top_score - 0.08):
+                selected_codes.append(code)
+            if len(selected_codes) >= settings.RAG_DOC_ROUTE_TOP_K:
+                break
 
     if not selected_codes and inferred_codes:
         selected_codes = inferred_codes[: settings.RAG_DOC_ROUTE_TOP_K]
@@ -122,7 +161,9 @@ def route_documents(
             "explicit_query_codes": inferred_codes,
             "scores": [{"code": code, "score": round(score, 5)} for code, score in ranked[:10]],
             "selected": selected_codes,
+            "dense_doc_scores": {code: round(score, 5) for code, score in dense_scores.items()},
+            "lexical_doc_scores": {code: round(score, 5) for code, score in lexical_scores.items()},
+            "clause_lexical_doc_scores": {code: round(score, 5) for code, score in lexical_scores_from_clauses.items()},
             "explicit_input_codes": list(explicit_l),
         },
     )
-
