@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import math
 import re
@@ -26,6 +27,38 @@ APOSTROPHE_VARIANTS = str.maketrans({
     "\u02bb": "'",
     "\u2032": "'",
 })
+PRIORITY_STOPWORDS = {
+    "aholi",
+    "punkt",
+    "punktlar",
+    "punktlari",
+    "turar",
+    "joy",
+    "bino",
+    "binolar",
+    "hudud",
+    "hududlar",
+    "minimal",
+    "maksimal",
+    "kamida",
+    "kopi",
+    "ko'pi",
+    "ulush",
+    "foiz",
+    "masofa",
+    "norma",
+    "meyor",
+    "me'yor",
+    "talab",
+    "qancha",
+    "necha",
+    "kerak",
+    "bo'lish",
+    "bolish",
+    "band",
+    "bob",
+    "hujjat",
+}
 
 
 @dataclass
@@ -53,6 +86,19 @@ def _tokenize(text: str) -> list[str]:
         return []
     normalized = repair_mojibake(text).lower().translate(APOSTROPHE_VARIANTS)
     return [_stem_token(w) for w in WORD_RE.findall(normalized) if len(w) > 2]
+
+
+def _priority_terms(text: str) -> list[str]:
+    terms = _tokenize(text)
+    candidates = [
+        term
+        for term in terms
+        if len(term) >= 4 and term not in PRIORITY_STOPWORDS
+    ]
+    if not candidates:
+        candidates = [term for term in terms if len(term) >= 5]
+    ranked = sorted(dict.fromkeys(candidates), key=len, reverse=True)
+    return ranked[:4]
 
 
 def _stem_token(token: str) -> str:
@@ -208,6 +254,7 @@ def retrieve_lexical_clauses(
     terms = _tokenize(query)
     if not terms:
         return []
+    priority_terms = _priority_terms(query)
     doc_codes = _normalize_doc_codes(document_code, document_codes)
 
     raw_query_terms = [
@@ -216,27 +263,46 @@ def retrieve_lexical_clauses(
         if len(token) > 2
     ]
     unique_terms = list(dict.fromkeys([*terms, *raw_query_terms]))[:10]
+    priority_search_terms = list(
+        dict.fromkeys(
+            [
+                *priority_terms,
+                *[
+                    variant
+                    for variant in (to_cp1251_mojibake(term) for term in priority_terms)
+                    if variant and variant not in priority_terms
+                ],
+            ]
+        )
+    )
     mojibake_terms = [
         variant
         for variant in (to_cp1251_mojibake(term) for term in unique_terms)
         if variant and variant not in unique_terms
     ]
-    search_terms = list(dict.fromkeys([*unique_terms, *mojibake_terms]))
-    ilike_filters = [Clause.text.ilike(f"%{term}%") for term in search_terms]
+    all_search_terms = list(dict.fromkeys([*unique_terms, *mojibake_terms]))
 
-    db_q = db.query(Clause).options(joinedload(Clause.document), joinedload(Clause.chapter))
-    if doc_codes:
-        db_q = db_q.filter(Clause.document.has(Document.code.in_(doc_codes)))
-    db_q = db_q.filter(or_(*ilike_filters)).limit(max(limit * 12, 120))
+    def _fetch_rows(search_terms: list[str]) -> list[Clause]:
+        if not search_terms:
+            return []
+        ilike_filters = [Clause.text.ilike(f"%{term}%") for term in search_terms]
+        db_q = db.query(Clause).options(joinedload(Clause.document), joinedload(Clause.chapter))
+        if doc_codes:
+            db_q = db_q.filter(Clause.document.has(Document.code.in_(doc_codes)))
+        return db_q.filter(or_(*ilike_filters)).order_by(Clause.order).all()
 
-    rows = db_q.all()
+    rows = _fetch_rows(priority_search_terms or all_search_terms)
+    if len(rows) < max(24, limit * 3) and priority_search_terms and priority_search_terms != all_search_terms:
+        row_map = {str(row.id): row for row in rows}
+        for row in _fetch_rows(all_search_terms):
+            row_map.setdefault(str(row.id), row)
+        rows = list(row_map.values())
     if len(rows) < max(24, limit * 3):
         broad_q = db.query(Clause).options(joinedload(Clause.document), joinedload(Clause.chapter))
         if doc_codes:
             broad_q = broad_q.filter(Clause.document.has(Document.code.in_(doc_codes)))
-        fallback_rows = broad_q.limit(max(limit * 60, 2400)).all()
         row_map = {str(row.id): row for row in rows}
-        for row in fallback_rows:
+        for row in broad_q.order_by(Clause.order).limit(max(limit * 120, 6000)).all():
             row_map.setdefault(str(row.id), row)
         rows = list(row_map.values())
 
@@ -251,12 +317,23 @@ def retrieve_lexical_clauses(
         coverage_clean = sum(1 for term in unique_terms if term in text_fixed)
         tf_mojibake = sum(text_raw.count(term) for term in mojibake_terms)
         coverage_mojibake = sum(1 for term in mojibake_terms if term in text_raw)
+        priority_tf = sum(text_fixed.count(term) for term in priority_terms)
+        priority_coverage = sum(1 for term in priority_terms if term in text_fixed)
 
         tf = max(tf_clean, tf_mojibake)
         coverage = max(coverage_clean, coverage_mojibake)
         if tf <= 0:
             continue
-        score = (coverage * 1.5) + math.log1p(tf)
+        if priority_terms and priority_coverage <= 0 and coverage < 2:
+            continue
+        score = (
+            (priority_coverage * 3.0)
+            + (coverage * 1.15)
+            + min(1.0, math.log1p(priority_tf) * 0.45)
+            + min(0.6, math.log1p(tf) * 0.18)
+        )
+        if priority_terms and priority_coverage == len(priority_terms):
+            score += 0.45
         item = RetrievedClause(
             clause_id=str(row.id),
             shnq_code=row.document.code if row.document else "",
@@ -296,10 +373,10 @@ def retrieve_db_dense_fallback(
     )
     if doc_codes:
         db_q = db_q.filter(ClauseEmbedding.shnq_code.in_(doc_codes))
-    rows = db_q.limit(max(limit * 12, 120)).all()
 
-    results: list[RetrievedClause] = []
-    for emb in rows:
+    heap: list[tuple[float, int, RetrievedClause]] = []
+    ordinal = 0
+    for emb in db_q.yield_per(256):
         if not emb.clause:
             continue
         if not emb.vector or len(emb.vector) != len(query_vec):
@@ -320,7 +397,13 @@ def retrieve_db_dense_fallback(
             dense_score=float(score),
             signals={"db_cosine": float(score)},
         )
-        if match_item_filters(item, metadata_filters):
-            results.append(item)
-    results.sort(key=lambda x: x.dense_score, reverse=True)
+        if not match_item_filters(item, metadata_filters):
+            continue
+        if len(heap) < max(limit, 1):
+            heapq.heappush(heap, (float(score), ordinal, item))
+        elif float(score) > heap[0][0]:
+            heapq.heapreplace(heap, (float(score), ordinal, item))
+        ordinal += 1
+
+    results = [item for _score, _ordinal, item in sorted(heap, key=lambda x: x[0], reverse=True)]
     return results[:limit]

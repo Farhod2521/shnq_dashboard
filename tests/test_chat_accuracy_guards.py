@@ -8,7 +8,9 @@ from app.services.chat_service import (
     _filter_items_by_query_anchors,
     _has_fewshot_mojibake,
     _is_route_ambiguous,
+    _order_final_candidates,
     _pick_exact_clause_candidate,
+    _query_anchor_terms,
     _stem_query_token,
 )
 from app.utils.text_fix import repair_mojibake
@@ -113,6 +115,41 @@ class ChatAccuracyGuardsTests(unittest.TestCase):
         )
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0].shnq_code, "SHNQ 2.07.01-23")
+
+    def test_query_anchor_terms_drop_generic_predicate_terms(self) -> None:
+        anchors = _query_anchor_terms(
+            "Hovli hojatxonasidan turar joy binosigacha masofa qancha bo'lishi kerak?"
+        )
+        self.assertIn("hojatxona", anchors)
+        self.assertNotIn("bo'lish", anchors)
+
+    def test_order_final_candidates_keeps_clause_first_for_general_query(self) -> None:
+        clause_item = RetrievalItem(
+            kind="clause",
+            score=0.81,
+            title="Band 128",
+            snippet="Mahalladagi ko'kalamzorlashtirilgan hududlarning ulushi kamida 25 foiz.",
+            shnq_code="SHNQ 2.07.01-23",
+            clause_id="c1",
+        )
+        row_item = RetrievalItem(
+            kind="table_row",
+            score=0.86,
+            title="Jadval 1 / satr 2",
+            snippet="Turar joy xonasida 1 m ...",
+            shnq_code="SHNQ 2.01.05-24",
+            table_id="t1",
+        )
+        ordered = _order_final_candidates(
+            "Aholi punktlarida ko'kalamzorlashtirilgan hududlarning minimal ulushi qancha bo'lishi kerak?",
+            [clause_item],
+            [row_item],
+            [],
+            type("Intent", (), {"intent": "topical_search"})(),
+        )
+        self.assertTrue(ordered)
+        self.assertEqual(ordered[0].kind, "clause")
+        self.assertEqual(ordered[0].shnq_code, "SHNQ 2.07.01-23")
 
 
 if __name__ == "__main__":

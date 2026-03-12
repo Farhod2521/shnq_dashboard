@@ -173,6 +173,21 @@ SPECIFICITY_STOPWORDS = {
     "band",
     "bob",
 }
+ANCHOR_STOPWORDS = SPECIFICITY_STOPWORDS | {
+    "aholi",
+    "punkt",
+    "punktlar",
+    "punktlari",
+    "turar",
+    "joy",
+    "bino",
+    "binolar",
+    "hudud",
+    "hududlar",
+    "masofa",
+    "bo'lish",
+    "bolish",
+}
 TABLE_CONTEXT_STOP_WORDS = {
     "jadval",
     "jadvlda",
@@ -929,15 +944,11 @@ def _extract_query_terms(text: str) -> list[str]:
 
 def _query_specific_terms(text: str) -> list[str]:
     terms = _extract_query_terms(text)
-    specific = [
-        term
-        for term in terms
-        if len(term) >= 7 and term not in SPECIFICITY_STOPWORDS
-    ]
+    specific = [term for term in terms if len(term) >= 4 and term not in ANCHOR_STOPWORDS]
     if specific:
-        return specific[:4]
-    # fallback: if no long terms, still keep 1-2 less-generic terms
-    secondary = [term for term in terms if term not in SPECIFICITY_STOPWORDS]
+        ranked = sorted(dict.fromkeys(specific), key=len, reverse=True)
+        return ranked[:4]
+    secondary = [term for term in terms if term not in SPECIFICITY_STOPWORDS and len(term) >= 4]
     return secondary[:2]
 
 
@@ -1717,11 +1728,49 @@ def _filter_items_by_query_anchors(query_text: str, items: list[RetrievalItem]) 
         semantic = float(item.semantic_score or 0.0)
         keyword = float(item.keyword_score or 0.0)
         numeric = float(item.numeric_score or 0.0)
-        if anchor_hit > 0 or semantic >= 0.78 or (numeric >= 0.45 and keyword >= 0.45):
+        if anchor_hit > 0 or semantic >= 0.82 or (numeric >= 0.45 and keyword >= 0.6):
             kept.append(item)
         else:
             rejected.append(item)
     return kept if kept else items
+
+
+def _order_final_candidates(
+    query: str,
+    clause_items: list[RetrievalItem],
+    row_items: list[RetrievalItem],
+    image_items: list[RetrievalItem],
+    intent: IntentResult,
+) -> list[RetrievalItem]:
+    table_intent = intent.intent == "table_lookup" or _is_table_intent_query(query)
+    row_priority = _is_table_row_priority_query(query)
+    image_intent = intent.intent == "image_lookup"
+
+    ordered: list[RetrievalItem]
+    if table_intent or row_priority:
+        ordered = [*row_items, *clause_items, *image_items]
+    elif image_intent:
+        ordered = [*image_items, *clause_items, *row_items]
+    elif clause_items:
+        top_clause_score = float(clause_items[0].score or 0.0)
+        support_threshold = max(settings.RAG_MIN_SCORE, top_clause_score - 0.12)
+        supporting_rows = [item for item in row_items if float(item.score or 0.0) >= support_threshold]
+        supporting_images = [item for item in image_items if float(item.score or 0.0) >= support_threshold]
+        ordered = [*clause_items, *supporting_rows[:2], *supporting_images[:1]]
+    else:
+        ordered = [*row_items, *image_items]
+
+    deduped: list[RetrievalItem] = []
+    seen: set[str] = set()
+    for item in ordered:
+        key = f"{item.kind}:{item.clause_id or item.table_id or item.image_id or item.title}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if len(deduped) >= max(settings.RAG_FINAL_K, settings.RAG_TOP_K):
+            break
+    return deduped
 
 
 def _route_scores_from_debug(route_debug: dict[str, object] | None) -> list[tuple[str, float]]:
@@ -2896,13 +2945,11 @@ def answer_message(
                     "image_urls": [],
                     "meta": meta,
                 }
-            else:
-                top_doc = (clause_items[0].shnq_code or "").strip() if clause_items else ""
-                if top_doc:
-                    clause_items = [item for item in clause_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
-                    row_items = [item for item in row_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
-                    image_items = [item for item in image_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
-                    best_score = clause_items[0].score if clause_items else 0.0
+            _log_debug(
+                "document_clarification_skipped",
+                reason="suggestions_disabled_keep_global_candidates",
+                docs=docs,
+            )
 
     explicit_clause_lookup = _is_explicit_clause_lookup(search_message) or intent_result.intent == "exact_band_reference"
     if explicit_clause_lookup and clause_items and len(exact_reference.clause_numbers) == 1:
@@ -2997,12 +3044,31 @@ def answer_message(
         no_match_text = _no_answer_with_filter_hint(filters_active, fallback="Mos band topilmadi")
         return {"answer": no_match_text, "sources": [], "table_html": None, "image_urls": [], "meta": meta}
 
-    all_candidates = [*clause_items, *row_items, *image_items]
-    rerank_debug = {"before_count": len(all_candidates), "after_count": len(all_candidates), "removed_duplicates": 0}
-    if settings.RAG_ENABLE_UNIFIED_RERANK:
+    preordered_candidates = _order_final_candidates(
+        original_message,
+        clause_items,
+        row_items,
+        image_items,
+        intent_result,
+    )
+    rerank_debug = {
+        "before_count": len([*clause_items, *row_items, *image_items]),
+        "after_count": len(preordered_candidates),
+        "removed_duplicates": 0,
+    }
+    use_unified_rerank = (
+        settings.RAG_ENABLE_UNIFIED_RERANK
+        and len({item.kind for item in preordered_candidates}) > 1
+        and (
+            intent_result.intent in {"table_lookup", "image_lookup"}
+            or not clause_items
+            or _is_table_row_priority_query(original_message)
+        )
+    )
+    if use_unified_rerank:
         reranked_items, reranked_debug = rerank_mixed_items(
             query=original_message,
-            items=all_candidates,
+            items=preordered_candidates,
             intent=intent_result,
             reference=exact_reference,
             limit=max(settings.RAG_FINAL_K, settings.RAG_TOP_K),
@@ -3028,7 +3094,7 @@ def answer_message(
             ],
         )
     else:
-        merged_all = sorted(all_candidates, key=lambda x: x.score, reverse=True)[: settings.RAG_FINAL_K]
+        merged_all = preordered_candidates[: settings.RAG_FINAL_K]
 
     confidence = assess_confidence(
         items=merged_all if merged_all else clause_items,
