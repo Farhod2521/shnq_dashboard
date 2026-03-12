@@ -3,21 +3,16 @@ from __future__ import annotations
 import re
 
 
-_MOJIBAKE_MARKERS = (
-    "К»",
-    "Кј",
-    "вЂ",
-    "Р‚",
-    "п»ї",
-    "Ð",
-    "Ñ",
+# Legacy mojibake fragments produced when UTF-8 text is decoded as CP1251.
+_CLASSIC_MOJIBAKE_RE = re.compile(
+    "(?:\u0420\u0459|\u0420\u0406\u0420|\u0420\u00A0\u0432\u0402|\u0420\u0457\u0412|\u0413[\u0450\u0451])"
 )
-
-_SUSPECT_RE = re.compile(r"[КвРпÐÑ]")
+# Common broken Uzbek apostrophe sequences: oК», gКј, etc.
+_APOSTROPHE_MOJIBAKE_RE = re.compile("\u041A[\u00BB\u0458\u0457\u00B0\u00B1\u0401\u0451]")
 
 
 def _marker_count(text: str) -> int:
-    return sum(text.count(marker) for marker in _MOJIBAKE_MARKERS)
+    return len(_CLASSIC_MOJIBAKE_RE.findall(text)) + len(_APOSTROPHE_MOJIBAKE_RE.findall(text))
 
 
 def repair_mojibake(text: str | None) -> str:
@@ -25,7 +20,7 @@ def repair_mojibake(text: str | None) -> str:
     value = (text or "").replace("\ufeff", "")
     if not value:
         return ""
-    if not _SUSPECT_RE.search(value):
+    if not (_CLASSIC_MOJIBAKE_RE.search(value) or _APOSTROPHE_MOJIBAKE_RE.search(value)):
         return value
 
     try:
@@ -52,4 +47,3 @@ def to_cp1251_mojibake(text: str | None) -> str:
         return value.encode("utf-8", errors="ignore").decode("windows-1251", errors="ignore")
     except Exception:
         return ""
-

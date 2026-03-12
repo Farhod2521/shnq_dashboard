@@ -202,6 +202,7 @@ APOSTROPHE_VARIANTS = str.maketrans({
     "\u02bb": "'",
     "\u2032": "'",
 })
+FEWSHOT_MOJIBAKE_RE = re.compile("\u041A[\u00BB\u0458\u0457\u00B0\u00B1\u0401\u0451]")
 CLARIFICATION_RULES = [
     ("missing_parameter", "Aniq qaysi parametr haqida?"),
     ("missing_comparison_target", "Qaysi ikki talabni solishtirmoqchisiz?"),
@@ -1267,6 +1268,17 @@ def _rewrite_query_if_needed(question: str) -> str:
         return question
 
 
+def _clean_fewshot_text(value: str) -> str:
+    cleaned = repair_mojibake((value or "").strip())
+    cleaned = cleaned.translate(APOSTROPHE_VARIANTS)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _has_fewshot_mojibake(value: str) -> bool:
+    return bool(FEWSHOT_MOJIBAKE_RE.search(value or ""))
+
+
 def _load_fewshot() -> list[dict[str, str]]:
     global _FEWSHOT_CACHE
     if _FEWSHOT_CACHE is not None:
@@ -1287,9 +1299,9 @@ def _load_fewshot() -> list[dict[str, str]]:
     for item in raw if isinstance(raw, list) else []:
         if not isinstance(item, dict):
             continue
-        question = (item.get("question") or "").strip()
-        answer = (item.get("answer") or "").strip()
-        if question and answer:
+        question = _clean_fewshot_text(item.get("question") or "")
+        answer = _clean_fewshot_text(item.get("answer") or "")
+        if question and answer and not (_has_fewshot_mojibake(question) or _has_fewshot_mojibake(answer)):
             cleaned.append({"question": question, "answer": answer})
     _FEWSHOT_CACHE = cleaned
     return _FEWSHOT_CACHE
@@ -1368,6 +1380,63 @@ def _extract_relevant_sentence(snippet: str, numeric_evidence: str | None) -> st
             if target in sentence.lower():
                 return sentence.strip()
     return (sentences[0] if sentences else text).strip()
+
+
+def _normalize_clause_number(value: str | None) -> str:
+    raw = (value or "").replace(",", ".")
+    match = re.search(r"\d+(?:\.\d+){0,3}", raw)
+    if not match:
+        return ""
+    number = match.group(0)
+    normalized_parts: list[str] = []
+    for part in number.split("."):
+        if part.isdigit():
+            normalized_parts.append(str(int(part)))
+        else:
+            normalized_parts.append(part)
+    return ".".join(normalized_parts)
+
+
+def _normalize_doc_for_match(value: str | None) -> str:
+    return re.sub(r"\s+", "", (value or "").strip().lower())
+
+
+def _pick_exact_clause_candidate(
+    clause_items: list[RetrievalItem],
+    reference: ExactReference,
+    requested_doc_code: str | None = None,
+) -> RetrievalItem | None:
+    target_clauses: set[str] = set()
+    for number in reference.clause_numbers:
+        normalized = _normalize_clause_number(number)
+        if normalized:
+            target_clauses.add(normalized)
+    if not target_clauses:
+        return None
+
+    doc_hints: set[str] = set()
+    if requested_doc_code:
+        normalized_requested = _normalize_doc_for_match(requested_doc_code)
+        if normalized_requested:
+            doc_hints.add(normalized_requested)
+    for code in reference.document_codes:
+        normalized_code = _normalize_doc_for_match(code)
+        if normalized_code:
+            doc_hints.add(normalized_code)
+
+    candidates: list[RetrievalItem] = []
+    for item in clause_items:
+        item_clause = _normalize_clause_number(item.clause_number)
+        if not item_clause or item_clause not in target_clauses:
+            continue
+        if doc_hints:
+            item_doc = _normalize_doc_for_match(item.shnq_code)
+            if item_doc not in doc_hints:
+                continue
+        candidates.append(item)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda x: float(x.score or 0.0))
 
 
 def _build_direct_clause_answer(item: RetrievalItem, response_language: str = "uz") -> str:
@@ -2448,6 +2517,30 @@ def answer_message(
                     row_items = [item for item in row_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
                     image_items = [item for item in image_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
                     best_score = clause_items[0].score if clause_items else 0.0
+
+    explicit_clause_lookup = _is_explicit_clause_lookup(search_message) or intent_result.intent == "exact_band_reference"
+    if explicit_clause_lookup and clause_items and len(exact_reference.clause_numbers) == 1:
+        exact_clause_item = _pick_exact_clause_candidate(
+            clause_items,
+            exact_reference,
+            requested_doc_code=requested_doc_code,
+        )
+        if exact_clause_item and float(exact_clause_item.score or 0.0) >= max(settings.RAG_MIN_SCORE, 0.12):
+            answer_text = _build_direct_clause_answer(exact_clause_item, response_language=detected_language)
+            meta = {
+                "type": "rag_direct",
+                "reason": "exact_clause_reference",
+                "model": settings.CHAT_MODEL,
+                "query_language": detected_language,
+            }
+            _attach_timing_meta(meta, timings, started_at)
+            return {
+                "answer": answer_text,
+                "sources": [_source_from_item(exact_clause_item)],
+                "table_html": None,
+                "image_urls": [],
+                "meta": meta,
+            }
 
     if _is_weak_clause_only_result(clause_items, row_items, image_items):
         numeric_rescue = _find_numeric_rescue_candidate(numeric_profile_primary, clause_items)
