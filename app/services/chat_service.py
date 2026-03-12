@@ -629,6 +629,55 @@ def _table_candidate_chapters(candidates: list[NormTable]) -> list[str]:
     return out
 
 
+def _format_table_reference_label(table_number: str | None) -> str:
+    value = (table_number or "").strip()
+    if not value:
+        return "Jadval"
+    if value.lower().startswith("ilova-"):
+        return f"{value.split('-', 1)[1]}-ilova"
+    return f"{value}-jadval"
+
+
+def _document_table_options(
+    db: Session,
+    doc_code: str,
+    limit: int = 12,
+) -> list[str]:
+    normalized_doc = (doc_code or "").strip()
+    if not normalized_doc:
+        return []
+
+    rows = (
+        db.query(NormTable)
+        .options(joinedload(NormTable.document), joinedload(NormTable.chapter))
+        .filter(NormTable.document.has(code=normalized_doc))
+        .order_by(NormTable.order)
+        .limit(max(limit * 6, 96))
+        .all()
+    )
+
+    options: list[str] = []
+    seen: set[str] = set()
+    for table in rows:
+        ref = _format_table_reference_label(table.table_number)
+        chapter = (table.section_title or (table.chapter.title if table.chapter else "") or "").strip()
+        title = (table.title or "").strip()
+        key = f"{ref.lower()}|{chapter.lower()}|{title.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        label = ref
+        if title:
+            label = f"{label} - {title}"
+        elif chapter:
+            label = f"{label} - {chapter}"
+        options.append(label)
+        if len(options) >= limit:
+            break
+    return options
+
+
 def _needs_clarification(text: str) -> tuple[str, str] | None:
     normalized = _normalize_text(text)
     if _is_document_list_request(normalized):
@@ -2049,6 +2098,17 @@ def _build_table_document_clarification_answer(
     )
 
 
+def _build_missing_table_number_answer(doc_code: str | None, table_options: list[str]) -> str:
+    if not doc_code:
+        return "Qaysi jadval nazarda tutilmoqda? (masalan: 9-jadval)"
+    if not table_options:
+        return f"{doc_code} bo'yicha qaysi jadval kerak? Jadval raqamini ham yozing."
+    return (
+        f"{doc_code} hujjatida quyidagi jadvallar bor. Aynan qaysi biri kerak?\n"
+        + "\n".join(f"{idx}. {value}" for idx, value in enumerate(table_options, start=1))
+    )
+
+
 def _extract_image_url_from_text(text: str) -> str | None:
     match = IMAGE_URL_RE.search(text or "")
     if not match:
@@ -2404,9 +2464,24 @@ def answer_message(
             if doc_code and _normalize_doc_code(doc_code) not in allowed_doc_codes:
                 doc_code = None
         if not table_number:
-            meta = {"type": "clarification", "missing_case": "missing_table_number", "model": settings.CHAT_MODEL, "query_language": detected_language}
+            table_doc_code = requested_doc_code or (filtered_doc_codes[0] if len(filtered_doc_codes) == 1 else None)
+            candidate_tables = _document_table_options(db, table_doc_code) if table_doc_code else []
+            meta = {
+                "type": "clarification",
+                "missing_case": "missing_table_number",
+                "model": settings.CHAT_MODEL,
+                "query_language": detected_language,
+            }
+            if candidate_tables:
+                meta["candidate_tables"] = candidate_tables
             _attach_timing_meta(meta, timings, started_at)
-            return {"answer": "Qaysi jadval nazarda tutilmoqda? (masalan: 9-jadval)", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
+            return {
+                "answer": _build_missing_table_number_answer(table_doc_code, candidate_tables),
+                "sources": [],
+                "table_html": None,
+                "image_urls": [],
+                "meta": meta,
+            }
         if not doc_code:
             docs = _table_candidate_docs(db, table_number)
             if filtered_doc_codes:

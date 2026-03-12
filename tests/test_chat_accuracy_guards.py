@@ -3,6 +3,7 @@ import unittest
 from app.rag.reference_parser import ExactReference
 from app.services.chat_service import (
     RetrievalItem,
+    _build_missing_table_number_answer,
     _clean_fewshot_text,
     _extract_doc_choice_from_text,
     _filter_items_by_query_anchors,
@@ -150,6 +151,18 @@ class ChatAccuracyGuardsTests(unittest.TestCase):
         self.assertTrue(ordered)
         self.assertEqual(ordered[0].kind, "clause")
         self.assertEqual(ordered[0].shnq_code, "SHNQ 2.07.01-23")
+
+    def test_build_missing_table_number_answer_lists_document_tables(self) -> None:
+        answer = _build_missing_table_number_answer(
+            "SHNQ 2.01.06-25",
+            [
+                "1-jadval - Seysmik yuklar",
+                "2-jadval - Konstruktiv tizimlar",
+            ],
+        )
+        self.assertIn("SHNQ 2.01.06-25 hujjatida quyidagi jadvallar bor", answer)
+        self.assertIn("1. 1-jadval - Seysmik yuklar", answer)
+        self.assertIn("2. 2-jadval - Konstruktiv tizimlar", answer)
 
 
 if __name__ == "__main__":
