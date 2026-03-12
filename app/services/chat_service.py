@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import re
 import time
@@ -22,9 +23,15 @@ from app.models.norm_table_cell import NormTableCell
 from app.models.norm_table_row import NormTableRow
 from app.models.question_answer import QuestionAnswer
 from app.models.table_row_embedding import TableRowEmbedding
+from app.rag.confidence import assess_confidence
+from app.rag.document_router import route_documents
 from app.rag.hybrid_search import reciprocal_rank_fusion
+from app.rag.metadata_filter import MetadataFilters, match_item_filters
+from app.rag.query_intent import IntentResult, classify_query_intent
+from app.rag.reference_parser import ExactReference, extract_document_codes, parse_exact_references
 from app.rag.re_ranker import rerank_clauses
 from app.rag.retriever import retrieve_db_dense_fallback, retrieve_dense_clauses, retrieve_lexical_clauses
+from app.rag.unified_reranker import rerank_mixed_items
 from app.utils.text_fix import repair_mojibake, to_cp1251_mojibake
 from app.services.llm_service import (
     detect_query_language,
@@ -35,6 +42,7 @@ from app.services.llm_service import (
     translate_query_for_search,
 )
 
+logger = logging.getLogger(__name__)
 
 DOCUMENT_CODE_RE = re.compile(r"\b(shnq|qmq|kmk|snip)\s*([0-9][0-9.\-]*)\b", re.IGNORECASE)
 TABLE_NUMBER_RE = re.compile(
@@ -200,6 +208,12 @@ class RetrievalItem:
     title: str
     snippet: str
     shnq_code: str
+    document_id: str | None = None
+    section_id: str | None = None
+    section_title: str | None = None
+    page: str | None = None
+    language: str | None = "uz"
+    content_type: str | None = None
     clause_id: str | None = None
     table_id: str | None = None
     table_number: str | None = None
@@ -224,6 +238,15 @@ def _normalize_text(text: str) -> str:
 
 def _contains_any(text: str, keywords: list[str]) -> bool:
     return any(keyword in text for keyword in keywords)
+
+
+def _log_debug(event: str, **kwargs: object) -> None:
+    if not settings.RAG_DEBUG_LOGGING:
+        return
+    try:
+        logger.info("[rag_debug] %s | %s", event, json.dumps(kwargs, ensure_ascii=False, default=str))
+    except Exception:
+        logger.info("[rag_debug] %s | %s", event, kwargs)
 
 
 def _is_greeting(text: str) -> bool:
@@ -251,10 +274,10 @@ def _build_out_of_scope_response() -> str:
 
 
 def _extract_doc_code(text: str) -> str | None:
-    match = DOCUMENT_CODE_RE.search(_normalize_text(text))
-    if not match:
+    codes = extract_document_codes(_normalize_text(text))
+    if not codes:
         return None
-    return f"{match.group(1).upper()} {match.group(2)}"
+    return codes[0]
 
 
 def _extract_table_number(text: str) -> str | None:
@@ -613,22 +636,73 @@ def _is_numeric_requirement_query(text: str) -> bool:
 
 
 def _extract_document_codes(text: str) -> list[str]:
-    normalized = _normalize_text(text)
-    out: list[str] = []
-    seen: set[str] = set()
-    for match in DOCUMENT_CODE_RE.finditer(normalized):
-        code = f"{match.group(1).upper()} {match.group(2)}"
-        key = code.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(code)
-    return out
+    return extract_document_codes(_normalize_text(text))
 
 
 def _is_document_list_request(text: str) -> bool:
     normalized = _normalize_text(text)
     return any(phrase in normalized for phrase in ("qaysi shnq", "qaysi hujjat", "qaysi norma", "qaysi normativ"))
+
+
+def _build_metadata_filters(
+    intent: IntentResult,
+    reference: ExactReference,
+    selected_doc_codes: list[str] | None = None,
+) -> MetadataFilters:
+    filters = MetadataFilters(
+        document_codes=[*reference.document_codes, *(selected_doc_codes or [])],
+        clause_numbers=reference.clause_numbers[:],
+        table_numbers=reference.table_numbers[:],
+        appendix_numbers=reference.appendix_numbers[:],
+        section_titles=[f"bob {n}" for n in reference.chapter_numbers] + [f"{n}-bob" for n in reference.chapter_numbers],
+    )
+    if intent.intent == "table_lookup":
+        filters.content_types = ["table_row"]
+    elif intent.intent == "image_lookup":
+        filters.content_types = ["image"]
+    elif intent.intent == "exact_band_reference":
+        filters.content_types = ["clause"]
+    return filters.normalized()
+
+
+def _search_exact_clause_references(
+    db: Session,
+    reference: ExactReference,
+    document_codes: list[str] | None,
+    metadata_filters: MetadataFilters | None = None,
+) -> list[RetrievalItem]:
+    clause_numbers = [x.strip() for x in reference.clause_numbers if x and x.strip()]
+    if not clause_numbers:
+        return []
+
+    query = db.query(Clause).options(joinedload(Clause.document), joinedload(Clause.chapter))
+    if document_codes:
+        query = query.filter(Clause.document.has(code=document_codes[0])) if len(document_codes) == 1 else query.filter(Clause.document.has(Document.code.in_(document_codes)))
+    rows = query.filter(Clause.clause_number.in_(clause_numbers)).limit(24).all()
+    out: list[RetrievalItem] = []
+    for row in rows:
+        item = RetrievalItem(
+            kind="clause",
+            score=1.35,
+            title=f"Band {row.clause_number or '-'}",
+            snippet=(row.text or "")[:900],
+            shnq_code=row.document.code if row.document else "",
+            document_id=str(row.document_id) if row.document_id else None,
+            section_id=str(row.chapter_id) if row.chapter_id else None,
+            section_title=row.chapter.title if row.chapter else None,
+            content_type="clause",
+            clause_id=str(row.id),
+            clause_number=row.clause_number,
+            html_anchor=row.html_anchor,
+            chapter=row.chapter.title if row.chapter else None,
+            lex_url=row.document.lex_url if row.document else None,
+            semantic_score=1.0,
+            keyword_score=1.0,
+        )
+        if match_item_filters(item, metadata_filters):
+            out.append(item)
+    out.sort(key=lambda x: x.score, reverse=True)
+    return out[:6]
 
 
 def _format_document_options(docs: list[str], title_by_code: dict[str, str] | None = None) -> str:
@@ -723,13 +797,40 @@ def _clause_confidence_weight(semantic: float, keyword: float) -> float:
     return 0.35 + (0.65 * quality)
 
 
-def _search_clause_candidates(db: Session, query: str, query_vec: list[float], doc_code: str | None) -> list[RetrievalItem]:
+def _search_clause_candidates(
+    db: Session,
+    query: str,
+    query_vec: list[float],
+    doc_codes: list[str] | None,
+    metadata_filters: MetadataFilters | None = None,
+) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
     specific_terms = _query_specific_terms(query)
-    dense = retrieve_dense_clauses(db=db, query_vec=query_vec, document_code=doc_code, limit=settings.RAG_DENSE_K)
+    dense = retrieve_dense_clauses(
+        db=db,
+        query_vec=query_vec,
+        document_code=None,
+        document_codes=doc_codes,
+        metadata_filters=metadata_filters,
+        limit=settings.RAG_DENSE_K,
+    )
     if not dense:
-        dense = retrieve_db_dense_fallback(db=db, query_vec=query_vec, document_code=doc_code, limit=settings.RAG_DENSE_K)
-    lexical = retrieve_lexical_clauses(db=db, query=query, document_code=doc_code, limit=settings.RAG_LEXICAL_K)
+        dense = retrieve_db_dense_fallback(
+            db=db,
+            query_vec=query_vec,
+            document_code=None,
+            document_codes=doc_codes,
+            metadata_filters=metadata_filters,
+            limit=settings.RAG_DENSE_K,
+        )
+    lexical = retrieve_lexical_clauses(
+        db=db,
+        query=query,
+        document_code=None,
+        document_codes=doc_codes,
+        metadata_filters=metadata_filters,
+        limit=settings.RAG_LEXICAL_K,
+    )
     fused = reciprocal_rank_fusion(dense, lexical, rrf_k=settings.RAG_RRF_K)
     fused = rerank_clauses(query, fused[: settings.RAG_RERANK_CANDIDATES], settings.RAG_TOP_K) if settings.RAG_ENABLE_RERANK else fused[: settings.RAG_TOP_K]
     out: list[RetrievalItem] = []
@@ -753,19 +854,28 @@ def _search_clause_candidates(db: Session, query: str, query_vec: list[float], d
                 title=item.title,
                 snippet=item.snippet,
                 shnq_code=item.shnq_code,
+                document_id=item.document_id,
+                section_id=item.section_id,
+                section_title=item.section_title,
+                page=item.page,
+                language=item.language,
+                content_type=item.content_type,
                 clause_id=item.clause_id,
+                clause_number=item.clause_number,
+                chapter=item.section_title,
                 semantic_score=semantic,
                 keyword_score=keyword,
             )
         )
-    return out
+    return [item for item in out if match_item_filters(item, metadata_filters)]
 
 
 def _search_table_row_candidates(
     db: Session,
     query: str,
     query_vec: list[float],
-    doc_code: str | None,
+    doc_codes: list[str] | None,
+    metadata_filters: MetadataFilters | None = None,
     row_priority: bool = False,
     limit_override: int | None = None,
 ) -> list[RetrievalItem]:
@@ -778,9 +888,10 @@ def _search_table_row_candidates(
     db_q = db.query(TableRowEmbedding).options(
         joinedload(TableRowEmbedding.row).joinedload(NormTableRow.table).joinedload(NormTable.document),
         joinedload(TableRowEmbedding.row).joinedload(NormTableRow.table).joinedload(NormTable.chapter),
+        joinedload(TableRowEmbedding.row).joinedload(NormTableRow.cells),
     )
-    if doc_code:
-        db_q = db_q.filter(TableRowEmbedding.shnq_code == doc_code)
+    if doc_codes:
+        db_q = db_q.filter(TableRowEmbedding.shnq_code.in_(doc_codes))
     effective_top_k = max(1, int(limit_override or settings.RAG_TABLE_ROW_TOP_K))
     scan_limit = max(settings.RAG_TABLE_ROW_SCAN_LIMIT, effective_top_k * 60)
     if terms:
@@ -802,10 +913,17 @@ def _search_table_row_candidates(
 
     for emb in candidates:
         table = emb.row.table if emb.row else None
+        row_cells = emb.row.cells if emb.row else []
+        header_text = " | ".join(
+            (cell.text or "").strip() for cell in sorted(row_cells, key=lambda x: x.col_index) if getattr(cell, "is_header", False) and (cell.text or "").strip()
+        )
+        row_text = " | ".join((cell.text or "").strip() for cell in sorted(row_cells, key=lambda x: x.col_index) if (cell.text or "").strip())
         combined_text = " | ".join(
             part
             for part in [
                 emb.search_text or "",
+                f"Header: {header_text}" if header_text else "",
+                f"Row: {row_text}" if row_text else "",
                 table.title if table and table.title else "",
                 table.section_title if table and table.section_title else "",
             ]
@@ -831,21 +949,25 @@ def _search_table_row_candidates(
         if row_priority and coverage == 0 and semantic < settings.RAG_TABLE_ROW_MIN_SCORE:
             continue
 
-        out.append(
-            RetrievalItem(
-                kind="table_row",
-                score=score,
-                title=f"Jadval {emb.table_number} / satr {emb.row_index}",
-                snippet=combined_text[:900],
-                shnq_code=emb.shnq_code,
-                table_id=str(table.id) if table else None,
-                table_number=emb.table_number,
-                chapter=table.section_title if table and table.section_title else (table.chapter.title if table and table.chapter else None),
-                row_index=emb.row_index,
-                semantic_score=semantic,
-                keyword_score=keyword,
-            )
+        item = RetrievalItem(
+            kind="table_row",
+            score=score,
+            title=f"Jadval {emb.table_number} / satr {emb.row_index}",
+            snippet=combined_text[:900],
+            shnq_code=emb.shnq_code,
+            document_id=str(table.document_id) if table and table.document_id else None,
+            section_id=str(table.chapter_id) if table and table.chapter_id else None,
+            section_title=table.section_title if table else None,
+            content_type="table_row",
+            table_id=str(table.id) if table else None,
+            table_number=emb.table_number,
+            chapter=table.section_title if table and table.section_title else (table.chapter.title if table and table.chapter else None),
+            row_index=emb.row_index,
+            semantic_score=semantic,
+            keyword_score=keyword,
         )
+        if match_item_filters(item, metadata_filters):
+            out.append(item)
     out.sort(key=lambda x: x.score, reverse=True)
     return out[: effective_top_k]
 
@@ -853,8 +975,9 @@ def _search_table_row_candidates(
 def _search_table_row_keyword_fallback(
     db: Session,
     query: str,
-    doc_code: str | None,
+    doc_codes: list[str] | None,
     limit: int,
+    metadata_filters: MetadataFilters | None = None,
 ) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
     if not terms:
@@ -879,8 +1002,11 @@ def _search_table_row_keyword_fallback(
         )
         .filter(or_(*filters))
     )
-    if doc_code:
-        db_q = db_q.filter(NormTable.document.has(code=doc_code))
+    if doc_codes:
+        if len(doc_codes) == 1:
+            db_q = db_q.filter(NormTable.document.has(code=doc_codes[0]))
+        else:
+            db_q = db_q.filter(NormTable.document.has(Document.code.in_(doc_codes)))
 
     rows = db_q.limit(max(limit * 50, 600)).all()
     by_row: dict[str, RetrievalItem] = {}
@@ -902,6 +1028,10 @@ def _search_table_row_keyword_fallback(
             title=f"Jadval {table.table_number} / satr {row.row_index}",
             snippet=cell_text[:900],
             shnq_code=table.document.code if table.document else "",
+            document_id=str(table.document_id) if table.document_id else None,
+            section_id=str(table.chapter_id) if table.chapter_id else None,
+            section_title=table.section_title,
+            content_type="table_row",
             table_id=str(table.id),
             table_number=table.table_number,
             chapter=table.section_title or (table.chapter.title if table.chapter else None),
@@ -909,7 +1039,7 @@ def _search_table_row_keyword_fallback(
             semantic_score=0.0,
             keyword_score=float(coverage / max(len(terms), 1)),
         )
-        if not prev or candidate.score > prev.score:
+        if (not prev or candidate.score > prev.score) and match_item_filters(candidate, metadata_filters):
             by_row[row_id] = candidate
 
     out = list(by_row.values())
@@ -917,15 +1047,21 @@ def _search_table_row_keyword_fallback(
     return out[: max(limit, 1)]
 
 
-def _search_image_candidates(db: Session, query: str, query_vec: list[float], doc_code: str | None) -> list[RetrievalItem]:
+def _search_image_candidates(
+    db: Session,
+    query: str,
+    query_vec: list[float],
+    doc_codes: list[str] | None,
+    metadata_filters: MetadataFilters | None = None,
+) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
     out: list[RetrievalItem] = []
     db_q = db.query(ImageEmbedding).options(
         joinedload(ImageEmbedding.image).joinedload(NormImage.document),
         joinedload(ImageEmbedding.image).joinedload(NormImage.chapter),
     )
-    if doc_code:
-        db_q = db_q.filter(ImageEmbedding.shnq_code == doc_code)
+    if doc_codes:
+        db_q = db_q.filter(ImageEmbedding.shnq_code.in_(doc_codes))
     for emb in db_q.all():
         image = emb.image
         context = " | ".join([p for p in [image.title if image else "", image.context_text if image else "", image.ocr_text if image else "", f"URL: {image.image_url}" if image else ""] if p])
@@ -934,22 +1070,26 @@ def _search_image_candidates(db: Session, query: str, query_vec: list[float], do
         score = semantic + (settings.RAG_KEYWORD_WEIGHT * keyword)
         if score < settings.RAG_IMAGE_MIN_SCORE and keyword <= 0:
             continue
-        out.append(
-            RetrievalItem(
-                kind="image",
-                score=score,
-                title=f"Rasm {emb.appendix_number or ''}".strip(),
-                snippet=context[:900],
-                shnq_code=emb.shnq_code,
-                image_id=str(emb.image_id) if emb.image_id else None,
-                chapter=emb.chapter_title,
-                appendix_number=emb.appendix_number,
-                html_anchor=image.html_anchor if image else None,
-                image_url=image.image_url if image else emb.image_url,
-                semantic_score=semantic,
-                keyword_score=keyword,
-            )
+        item = RetrievalItem(
+            kind="image",
+            score=score,
+            title=f"Rasm {emb.appendix_number or ''}".strip(),
+            snippet=context[:900],
+            shnq_code=emb.shnq_code,
+            document_id=str(image.document_id) if image and image.document_id else None,
+            section_id=str(image.chapter_id) if image and image.chapter_id else None,
+            section_title=image.section_title if image else None,
+            content_type="image",
+            image_id=str(emb.image_id) if emb.image_id else None,
+            chapter=emb.chapter_title,
+            appendix_number=emb.appendix_number,
+            html_anchor=image.html_anchor if image else None,
+            image_url=image.image_url if image else emb.image_url,
+            semantic_score=semantic,
+            keyword_score=keyword,
         )
+        if match_item_filters(item, metadata_filters):
+            out.append(item)
     out.sort(key=lambda x: x.score, reverse=True)
     return out[: max(1, settings.RAG_IMAGE_TOP_K)]
 
@@ -1068,6 +1208,7 @@ def _build_rag_prompt(
     context_items: list[RetrievalItem],
     response_language: str = "uz",
     fewshot_examples: list[dict[str, str]] | None = None,
+    intent: IntentResult | None = None,
 ) -> tuple[str, str]:
     chunks: list[str] = []
     for idx, item in enumerate(context_items, start=1):
@@ -1117,6 +1258,7 @@ def _build_rag_prompt(
     detailed_label, short_label = _answer_labels(response_language)
     doc_list_instruction = ""
     table_instruction = ""
+    compare_instruction = ""
     if _is_document_list_request(question):
         doc_list_instruction = " Agar savolda qaysi SHNQ/hujjat so'ralgan bo'lsa, kontekstdagi SHNQ kodlarini to'liq ro'yxat qilib bering."
     if _is_table_intent_query(question):
@@ -1124,14 +1266,37 @@ def _build_rag_prompt(
             " Agar savol jadval/satr haqida bo'lsa, avval jadval satri kontekstiga tayangan holda javob bering, "
             "jadval raqami va satrni ko'rsating. Jadval bo'yicha aniq ma'lumot topilmasa, buni ochiq yozing."
         )
+    if intent and intent.intent == "compare_documents":
+        compare_instruction = " Taqqoslash savollarida har bir hujjat bo'yicha dalilni alohida ko'rsatib, farqini qisqa xulosa qiling."
     system = (
-        "Siz SHNQ AI'siz. Faqat SHNQ/QMQ va qurilish normalari hujjatlariga tayangan holda javob bering. "
-        "Hech qachon norma o'ylab topmang. Kontekstda javob bo'lmasa, buni ochiq ayting. "
-        f"Javobda faqat ikki qism bo'lsin: batafsil va qisqa xulosa.{doc_list_instruction}{table_instruction}"
+        "Siz SHNQ qurilish me'yorlari bo'yicha ekspert AI yordamchisiz.\n\n"
+
+        "Qoidalar:\n"
+        "1. Faqat berilgan kontekst asosida javob bering.\n"
+        "2. Hech qachon kontekstda bo'lmagan norma yoki talabni o'ylab topmang.\n"
+        "3. Agar kontekstda aniq javob bo'lmasa 'kontekstda aniq javob topilmadi' deb yozing.\n"
+        "4. Javobda imkon qadar SHNQ hujjat kodi, bob va bandni ko'rsating.\n"
+        "5. Agar jadval ishlatilsa jadval raqami va satrni ko'rsating.\n"
+        "6. Javob texnik, aniq va ortiqcha umumiy gaplarsiz bo'lsin.\n"
+        "7. Qurilish me'yorlariga zid yoki taxminiy maslahat bermang.\n"
+        "8. Agar bir nechta manba bo'lsa, eng mosini tanlang va javobni aralashtirmang.\n\n"
+
+        "Javob formati:\n"
+        "Batafsil qismida norma tushuntirilsin, kerak bo'lsa raqamlar yozilsin, manba sifatida SHNQ kodi va band ko'rsatilsin.\n"
+        "Qisqa qilib aytganda qismida 1-2 jumlalik xulosa yozilsin.\n\n"
+
+        "Kontekst bir nechta 'Manba' bloklaridan iborat.\n"
+        "Har bir manba alohida hujjatdan olingan.\n"
+        "Eng mos manbani tanlab javob bering.\n\n"
+
+        f"{doc_list_instruction}{table_instruction}{compare_instruction}"
     )
     prompt = (
         f"Savol: {question}\n\nKontekst:\n{context}{fewshot_block}\n\n"
-        f"Format:\n{detailed_label}:\n{short_label}:\n\nJavob:"
+        "Format:\n"
+        "Batafsil:\n"
+        "Qisqa qilib aytganda:\n\n"
+        "Javob:"
     )
     return system, prompt
 
@@ -1294,6 +1459,11 @@ def _hydrate_clause_items(db: Session, items: list[RetrievalItem]) -> None:
         item.clause_number = row.clause_number
         item.html_anchor = row.html_anchor
         item.chapter = row.chapter.title if row.chapter else item.chapter
+        item.section_id = str(row.chapter_id) if row.chapter_id else item.section_id
+        item.section_title = row.chapter.title if row.chapter else item.section_title
+        item.document_id = str(row.document_id) if row.document_id else item.document_id
+        item.content_type = item.content_type or "clause"
+        item.language = item.language or "uz"
         if row.document:
             item.shnq_code = row.document.code
             item.lex_url = row.document.lex_url
@@ -1306,6 +1476,12 @@ def _source_from_item(item: RetrievalItem) -> dict[str, object]:
         return {
             "type": "clause",
             "shnq_code": item.shnq_code,
+            "document_id": item.document_id,
+            "section_id": item.section_id,
+            "section_title": item.section_title,
+            "page": item.page,
+            "language": item.language,
+            "content_type": item.content_type or "clause",
             "chapter": item.chapter,
             "clause_number": item.clause_number,
             "html_anchor": item.html_anchor,
@@ -1319,6 +1495,12 @@ def _source_from_item(item: RetrievalItem) -> dict[str, object]:
         return {
             "type": "image",
             "shnq_code": item.shnq_code,
+            "document_id": item.document_id,
+            "section_id": item.section_id,
+            "section_title": item.section_title,
+            "page": item.page,
+            "language": item.language,
+            "content_type": item.content_type or "image",
             "chapter": item.chapter,
             "appendix_number": item.appendix_number,
             "title": item.title,
@@ -1332,6 +1514,12 @@ def _source_from_item(item: RetrievalItem) -> dict[str, object]:
     return {
         "type": "table_row",
         "shnq_code": item.shnq_code,
+        "document_id": item.document_id,
+        "section_id": item.section_id,
+        "section_title": item.section_title,
+        "page": item.page,
+        "language": item.language,
+        "content_type": item.content_type or "table_row",
         "chapter": item.chapter,
         "table_number": item.table_number,
         "title": item.title,
@@ -1486,8 +1674,18 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         return {"answer": _build_out_of_scope_response(), "sources": [], "table_html": None, "image_urls": [], "meta": meta}
 
     requested_doc_code = document_code or _extract_doc_code(original_message) or _extract_doc_code(search_message)
+    exact_reference = parse_exact_references(search_message)
+    intent_result = classify_query_intent(search_message, exact_reference)
+    _log_debug(
+        "intent_selected",
+        intent=intent_result.intent,
+        confidence=intent_result.confidence,
+        reason=intent_result.reason,
+        reference=intent_result.reference.to_debug_dict(),
+        requested_doc_code=requested_doc_code,
+    )
 
-    if _is_table_request(search_message):
+    if _is_table_request(search_message) or intent_result.intent == "table_lookup":
         table, table_number, doc_code, candidates = _find_table_for_query(db, search_message, requested_doc_code)
         if not table_number:
             meta = {"type": "clarification", "missing_case": "missing_table_number", "model": settings.CHAT_MODEL, "query_language": detected_language}
@@ -1600,6 +1798,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             "model": settings.CHAT_MODEL,
             "query_language": detected_language,
             "table_prelocalized": _has_pretranslated_table_content(table, detected_language),
+            "intent": intent_result.intent,
+            "exact_reference": exact_reference.to_debug_dict(),
         }
         _attach_timing_meta(meta, timings, started_at)
         return {"answer": answer, "sources": [source], "table_html": table_html, "image_urls": [], "meta": meta}
@@ -1614,15 +1814,59 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     rewritten_secondary: str | None = None
     translation_fallback_used = False
 
-    def compute_candidates(query_text: str) -> tuple[list[RetrievalItem], list[RetrievalItem], list[RetrievalItem]]:
+    def compute_candidates(
+        query_text: str,
+    ) -> tuple[list[RetrievalItem], list[RetrievalItem], list[RetrievalItem], list[str], MetadataFilters, dict[str, object]]:
         t_embed = time.perf_counter()
         query_vec = embed_text(query_text)
         timings["embed"] = round(timings["embed"] + ((time.perf_counter() - t_embed) * 1000), 2)
-        clause_items = _search_clause_candidates(db, query_text, query_vec, requested_doc_code)
+        route_result = route_documents(
+            db=db,
+            query=query_text,
+            query_vec=query_vec,
+            requested_doc_code=requested_doc_code,
+            explicit_doc_codes=exact_reference.document_codes,
+        )
+        selected_doc_codes = route_result.document_codes
+        metadata_filters = _build_metadata_filters(intent_result, exact_reference, selected_doc_codes)
+        _log_debug(
+            "document_route",
+            query=query_text,
+            selected_doc_codes=selected_doc_codes,
+            route_debug=route_result.debug,
+            metadata_filters={
+                "document_codes": metadata_filters.document_codes,
+                "clause_numbers": metadata_filters.clause_numbers,
+                "table_numbers": metadata_filters.table_numbers,
+                "appendix_numbers": metadata_filters.appendix_numbers,
+                "content_types": metadata_filters.content_types,
+            },
+        )
+
+        exact_clause_items: list[RetrievalItem] = []
+        if intent_result.intent == "exact_band_reference":
+            exact_clause_items = _search_exact_clause_references(
+                db=db,
+                reference=exact_reference,
+                document_codes=selected_doc_codes,
+                metadata_filters=metadata_filters,
+            )
+        clause_items = _search_clause_candidates(
+            db=db,
+            query=query_text,
+            query_vec=query_vec,
+            doc_codes=selected_doc_codes,
+            metadata_filters=metadata_filters,
+        )
+        if exact_clause_items:
+            clause_items = _merge_retrieval_candidates(exact_clause_items, clause_items, secondary_weight=0.96)
         if not clause_items:
             raw_q = db.query(Clause).options(joinedload(Clause.document))
-            if requested_doc_code:
-                raw_q = raw_q.filter(Clause.document.has(code=requested_doc_code))
+            if selected_doc_codes:
+                if len(selected_doc_codes) == 1:
+                    raw_q = raw_q.filter(Clause.document.has(code=selected_doc_codes[0]))
+                else:
+                    raw_q = raw_q.filter(Clause.document.has(Document.code.in_(selected_doc_codes)))
             raw_rows = raw_q.order_by(Clause.order).limit(4000).all()
             words = _extract_query_terms(query_text)
             keyword_hits: list[RetrievalItem] = []
@@ -1645,6 +1889,10 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                         title=f"Band {row.clause_number or '-'}",
                         snippet=(row.text or "")[:900],
                         shnq_code=row.document.code if row.document else "",
+                        document_id=str(row.document_id) if row.document_id else None,
+                        section_id=str(row.chapter_id) if row.chapter_id else None,
+                        section_title=row.chapter.title if row.chapter else None,
+                        content_type="clause",
                         clause_id=str(row.id),
                         clause_number=row.clause_number,
                         html_anchor=row.html_anchor,
@@ -1655,12 +1903,12 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                     )
                 )
             keyword_hits.sort(key=lambda x: x.score, reverse=True)
-            clause_items = keyword_hits[: settings.RAG_TOP_K]
+            clause_items = [item for item in keyword_hits if match_item_filters(item, metadata_filters)][: settings.RAG_TOP_K]
 
         clause_best_score = clause_items[0].score if clause_items else 0.0
         normalized_query = _normalize_text(query_text)
         row_priority = _is_table_row_priority_query(query_text)
-        table_intent = _is_table_intent_query(query_text)
+        table_intent = intent_result.intent == "table_lookup" or _is_table_intent_query(query_text)
         explicit_clause_lookup = _is_explicit_clause_lookup(query_text)
         numeric_requirement = _is_numeric_requirement_query(query_text)
         allow_table_search = (table_intent or row_priority) and not explicit_clause_lookup
@@ -1680,7 +1928,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                 db,
                 query_text,
                 query_vec,
-                requested_doc_code,
+                selected_doc_codes,
+                metadata_filters=metadata_filters,
                 row_priority=row_priority,
                 limit_override=row_top_k,
             )
@@ -1695,24 +1944,37 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                 row_fallback = _search_table_row_keyword_fallback(
                     db,
                     query_text,
-                    requested_doc_code,
+                    selected_doc_codes,
                     limit=max(row_top_k, 8),
+                    metadata_filters=metadata_filters,
                 )
                 if row_fallback:
                     row_items = _merge_retrieval_candidates(row_items, row_fallback, secondary_weight=1.05)
 
-        image_intent = any(h in normalized_query for h in ["rasm", "image", "diagramma", "sxema", "surat", "chizma"])
+        image_intent = intent_result.intent == "image_lookup" or any(h in normalized_query for h in ["rasm", "image", "diagramma", "sxema", "surat", "chizma"])
         need_image_sources = image_intent or clause_best_score < settings.RAG_MIN_SCORE
-        image_items = _search_image_candidates(db, query_text, query_vec, requested_doc_code) if need_image_sources else []
+        image_items = (
+            _search_image_candidates(db, query_text, query_vec, selected_doc_codes, metadata_filters=metadata_filters)
+            if need_image_sources
+            else []
+        )
         if image_items and not image_intent:
             image_items = [
                 item
                 for item in image_items
                 if item.score >= max(settings.RAG_IMAGE_MIN_SCORE + 0.08, 0.3)
             ]
-        return clause_items, row_items, image_items
+        _log_debug(
+            "candidate_counts",
+            query=query_text,
+            clause=len(clause_items),
+            table_row=len(row_items),
+            image=len(image_items),
+            top_clause_score=round(clause_best_score, 4),
+        )
+        return clause_items, row_items, image_items, selected_doc_codes, metadata_filters, route_result.debug
 
-    clause_items, row_items, image_items = compute_candidates(rewritten_primary)
+    clause_items, row_items, image_items, selected_docs_primary, _metadata_filters_primary, route_debug_primary = compute_candidates(rewritten_primary)
     primary_best_score = clause_items[0].score if clause_items else 0.0
     can_try_translated_fallback = (
         secondary_query_message
@@ -1721,16 +1983,18 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     )
     if can_try_translated_fallback and ((not clause_items) or primary_best_score < settings.RAG_TRANSLATION_FALLBACK_THRESHOLD):
         rewritten_secondary = _rewrite_query_if_needed(secondary_query_message)
-        sec_clause, sec_rows, sec_images = compute_candidates(rewritten_secondary)
+        sec_clause, sec_rows, sec_images, sec_docs, _sec_filters, sec_route_debug = compute_candidates(rewritten_secondary)
         if sec_clause:
             clause_items = _merge_retrieval_candidates(clause_items, sec_clause, secondary_weight=settings.RAG_TRANSLATED_QUERY_SCORE_WEIGHT)
             translation_fallback_used = True
+            _log_debug("secondary_clause_merge", selected_docs=sec_docs, route_debug=sec_route_debug, count=len(sec_clause))
         if sec_rows:
             row_items = _merge_retrieval_candidates(row_items, sec_rows, secondary_weight=settings.RAG_TRANSLATED_QUERY_SCORE_WEIGHT)
         if sec_images:
             image_items = _merge_retrieval_candidates(image_items, sec_images, secondary_weight=settings.RAG_TRANSLATED_QUERY_SCORE_WEIGHT)
 
     if requested_doc_code and not clause_items and not image_items and not row_items:
+        _log_debug("no_answer_trigger", reason="requested_document_no_items", requested_doc_code=requested_doc_code)
         meta = {"type": "no_match", "target": "document", "model": settings.CHAT_MODEL, "query_language": detected_language}
         _attach_timing_meta(meta, timings, started_at)
         return {"answer": f"{requested_doc_code} bo'yicha mos band topilmadi.", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
@@ -1738,6 +2002,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
     best_score = clause_items[0].score if clause_items else 0.0
     if not requested_doc_code:
         ask_doc, docs = _should_ask_document_clarification(clause_items, best_score)
+        if ask_doc and intent_result.intent == "compare_documents":
+            ask_doc = False
         if ask_doc:
             if settings.RAG_ALLOW_DOCUMENT_SUGGESTIONS:
                 title_by_code = _get_document_titles_by_code(db, docs)
@@ -1756,14 +2022,16 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
                     "image_urls": [],
                     "meta": meta,
                 }
-            top_doc = (clause_items[0].shnq_code or "").strip() if clause_items else ""
-            if top_doc:
-                clause_items = [item for item in clause_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
-                row_items = [item for item in row_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
-                image_items = [item for item in image_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
-                best_score = clause_items[0].score if clause_items else 0.0
+            else:
+                top_doc = (clause_items[0].shnq_code or "").strip() if clause_items else ""
+                if top_doc:
+                    clause_items = [item for item in clause_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
+                    row_items = [item for item in row_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
+                    image_items = [item for item in image_items if (item.shnq_code or "").strip().lower() == top_doc.lower()]
+                    best_score = clause_items[0].score if clause_items else 0.0
 
     if _is_weak_clause_only_result(clause_items, row_items, image_items):
+        _log_debug("no_answer_trigger", reason="weak_clause_only_result")
         if requested_doc_code:
             message_text = f"{requested_doc_code} bo'yicha savolga mos band aniq topilmadi."
         else:
@@ -1786,10 +2054,65 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             _attach_timing_meta(meta, timings, started_at)
             return {"answer": question, "sources": [], "table_html": None, "image_urls": [], "meta": meta}
         meta = {"type": "no_match", "model": settings.CHAT_MODEL, "query_language": detected_language}
+        _log_debug("no_answer_trigger", reason="best_score_below_strict_without_support", best_score=best_score)
         _attach_timing_meta(meta, timings, started_at)
         return {"answer": "Mos band topilmadi.", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
 
-    merged_all = sorted([*clause_items, *row_items, *image_items], key=lambda x: x.score, reverse=True)[: settings.RAG_FINAL_K]
+    all_candidates = [*clause_items, *row_items, *image_items]
+    rerank_debug = {"before_count": len(all_candidates), "after_count": len(all_candidates), "removed_duplicates": 0}
+    if settings.RAG_ENABLE_UNIFIED_RERANK:
+        reranked_items, reranked_debug = rerank_mixed_items(
+            query=original_message,
+            items=all_candidates,
+            intent=intent_result,
+            reference=exact_reference,
+            limit=max(settings.RAG_FINAL_K, settings.RAG_TOP_K),
+            duplicate_sim_threshold=settings.RAG_DUPLICATE_SIM_THRESHOLD,
+        )
+        merged_all = reranked_items
+        rerank_debug = {
+            "before_count": reranked_debug.before_count,
+            "after_count": reranked_debug.after_count,
+            "removed_duplicates": reranked_debug.removed_duplicates,
+        }
+        _log_debug(
+            "unified_rerank",
+            debug=rerank_debug,
+            top_after=[
+                {
+                    "kind": item.kind,
+                    "doc": item.shnq_code,
+                    "score": round(item.score, 4),
+                    "id": item.clause_id or item.table_id or item.image_id,
+                }
+                for item in merged_all[:5]
+            ],
+        )
+    else:
+        merged_all = sorted(all_candidates, key=lambda x: x.score, reverse=True)[: settings.RAG_FINAL_K]
+
+    confidence = assess_confidence(
+        items=merged_all if merged_all else clause_items,
+        strict_min_score=settings.RAG_STRICT_MIN_SCORE,
+        min_score=settings.RAG_MIN_SCORE,
+        intent=intent_result,
+        reference=exact_reference,
+    )
+    _log_debug("confidence_assessed", confidence=confidence.to_dict())
+    if confidence.no_answer and not (row_items or image_items) and not relaxed:
+        message_text = "Kontekstda yetarli ishonchli dalil topilmadi. Iltimos, savolni aniqroq yozing."
+        if confidence.reason == "exact_clause_not_found" and exact_reference.clause_numbers:
+            message_text = f"{', '.join(exact_reference.clause_numbers)} band bo'yicha aniq moslik topilmadi."
+        meta = {
+            "type": "no_match",
+            "reason": confidence.reason,
+            "confidence": confidence.to_dict(),
+            "model": settings.CHAT_MODEL,
+            "query_language": detected_language,
+        }
+        _attach_timing_meta(meta, timings, started_at)
+        return {"answer": message_text, "sources": [], "table_html": None, "image_urls": [], "meta": meta}
+
     merged = _select_context_items(original_message, merged_all)
     _hydrate_clause_items(db, merged)
     if not merged:
@@ -1798,7 +2121,13 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         return {"answer": "Mos band topilmadi.", "sources": [], "table_html": None, "image_urls": [], "meta": meta}
 
     fewshot_examples = _pick_fewshot_examples(original_message, limit=3)
-    system, prompt = _build_rag_prompt(original_message, merged, response_language=detected_language, fewshot_examples=fewshot_examples)
+    system, prompt = _build_rag_prompt(
+        original_message,
+        merged,
+        response_language=detected_language,
+        fewshot_examples=fewshot_examples,
+        intent=intent_result,
+    )
 
     # LLM chaqiruvi vaqtida DB connectionni band qilib turmaslik uchun
     # read-only transactionni yakunlaymiz.
@@ -1910,6 +2239,10 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         "embedding_model": settings.EMBEDDING_MODEL,
         "answer_language": detected_language,
         "query_language": detected_language,
+        "intent": intent_result.intent,
+        "intent_confidence": round(intent_result.confidence, 4),
+        "intent_reason": intent_result.reason,
+        "exact_reference": exact_reference.to_debug_dict(),
         "min_score": settings.RAG_MIN_SCORE,
         "strict_min_score": settings.RAG_STRICT_MIN_SCORE,
         "relaxed_threshold_used": best_score < settings.RAG_STRICT_MIN_SCORE and relaxed,
@@ -1921,6 +2254,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         "query_used_fallback": rewritten_secondary,
         "query_original": original_message,
         "requested_document": requested_doc_code,
+        "document_route_primary": selected_docs_primary,
+        "document_route_debug_primary": route_debug_primary,
         "multilingual_native_first": settings.RAG_MULTILINGUAL_NATIVE_FIRST,
         "translation_fallback_used": translation_fallback_used,
         "translation_fallback_threshold": settings.RAG_TRANSLATION_FALLBACK_THRESHOLD,
@@ -1939,6 +2274,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
             "table_row": len(row_items),
             "image": len(image_items),
         },
+        "confidence": confidence.to_dict(),
+        "rerank_debug": rerank_debug,
         "top_clause_signal": {
             "semantic": round(float(top_clause.semantic_score or 0.0), 4) if top_clause else 0.0,
             "keyword": round(float(top_clause.keyword_score or 0.0), 4) if top_clause else 0.0,
@@ -1950,6 +2287,8 @@ def answer_message(db: Session, message: str, document_code: str | None = None) 
         "llm_error": llm_error,
         "llm_error_detail": llm_error_detail,
     }
+    if confidence.warning:
+        meta["warning"] = confidence.warning
     _attach_timing_meta(meta, timings, started_at)
 
     return {"answer": answer, "sources": sources, "table_html": table_html, "image_urls": image_urls, "meta": meta}

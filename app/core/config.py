@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     RAG_DOC_DOMINANCE_MIN_RATIO: float = 0.8
     RAG_STRONG_KEYWORD_MIN: float = 0.3
     RAG_DOMINANCE_WINDOW: int = 5
+    RAG_DOC_ROUTE_TOP_K: int = 3
+    RAG_DOC_ROUTE_DENSE_K: int = 50
+    RAG_DOC_ROUTE_MIN_SCORE: float = 0.12
+    RAG_ENABLE_UNIFIED_RERANK: bool = True
+    RAG_DUPLICATE_SIM_THRESHOLD: float = 0.9
+    RAG_DEBUG_LOGGING: bool = True
     PIPELINE_MAX_PARALLEL: int = 2
     EMBEDDING_TIMEOUT_SECONDS: int = 60
 

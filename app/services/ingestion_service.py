@@ -733,6 +733,11 @@ def run_document_pipeline(document_id: str):
                     shnq_code=document.code,
                     clause_number=clause.clause_number,
                     chapter_title=chapter_title,
+                    document_id=str(clause.document_id) if clause.document_id else None,
+                    section_id=str(clause.chapter_id) if clause.chapter_id else None,
+                    page=None,
+                    language="uz",
+                    content_type="clause",
                 )
         except Exception:
             db.rollback()

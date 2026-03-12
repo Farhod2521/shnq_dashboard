@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import defaultdict
 
 from app.rag.retriever import RetrievedClause
 
@@ -11,6 +12,35 @@ WORD_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF']+")
 
 def _tokenize(text: str) -> list[str]:
     return [w.lower() for w in WORD_RE.findall(text or "") if len(w) > 2]
+
+
+def _fingerprint(text: str) -> str:
+    tokens = sorted(set(_tokenize(text)))
+    return " ".join(tokens[:40])
+
+
+def _dedupe_items(items: list[RetrievedClause], sim_threshold: float = 0.9) -> list[RetrievedClause]:
+    out: list[RetrievedClause] = []
+    by_doc_fingerprint: defaultdict[str, list[str]] = defaultdict(list)
+    for item in items:
+        doc_key = (item.shnq_code or "").strip().lower()
+        fp = _fingerprint(item.snippet)
+        if not fp:
+            out.append(item)
+            continue
+        duplicate = False
+        for seen_fp in by_doc_fingerprint[doc_key]:
+            shared = len(set(seen_fp.split()) & set(fp.split()))
+            denom = max(len(set(seen_fp.split())), len(set(fp.split())), 1)
+            similarity = shared / denom
+            if similarity >= sim_threshold:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        by_doc_fingerprint[doc_key].append(fp)
+        out.append(item)
+    return out
 
 
 def rerank_clauses(
@@ -32,19 +62,23 @@ def rerank_clauses(
         snippet_l = (item.snippet or "").lower()
         overlap = sum(1 for t in query_terms if t in snippet_l)
         coverage = overlap / max(len(query_terms), 1)
+        exact_clause_boost = 0.0
+        if item.clause_number and item.clause_number in query:
+            exact_clause_boost = 0.12
 
-        # Hybrid relevance + lexical coverage + dense confidence.
-        # This keeps speed high and improves precision on legal text.
         item.rerank_score = (
-            (item.hybrid_score * 0.55)
-            + (item.dense_score * 0.25)
-            + (item.lexical_score * 0.10)
-            + (coverage * 0.10)
+            (item.hybrid_score * 0.52)
+            + (item.dense_score * 0.24)
+            + (item.lexical_score * 0.12)
+            + (coverage * 0.12)
+            + exact_clause_boost
         )
         if overlap > 0:
             item.rerank_score += min(0.03, math.log1p(overlap) * 0.01)
         item.signals["overlap"] = float(overlap)
         item.signals["coverage"] = float(coverage)
+        item.signals["exact_clause_boost"] = float(exact_clause_boost)
 
     items.sort(key=lambda x: x.rerank_score, reverse=True)
-    return items[:limit]
+    deduped = _dedupe_items(items)
+    return deduped[:limit]
