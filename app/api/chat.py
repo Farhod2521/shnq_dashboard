@@ -2,7 +2,7 @@ from datetime import datetime
 import re
 import uuid
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
@@ -17,6 +17,7 @@ from app.models.document import Document
 from app.models.feedback_event import FeedbackEvent
 from app.models.section import Section
 from app.services.auth_service import extract_bearer_token, get_user_by_token
+from app.services.chat_export_service import build_chat_export_html, build_export_filename
 from app.services.chat_service import ChatQueryFilters, answer_message
 from app.services.feedback_service import upsert_rejected_qa, upsert_verified_qa
 
@@ -58,6 +59,30 @@ class ChatFeedbackRequest(BaseModel):
     vote: str
     reason: str | None = None
     room_id: str | None = None
+
+
+class ChatExportSourceItem(BaseModel):
+    type: str | None = None
+    shnq_code: str | None = None
+    chapter: str | None = None
+    clause_number: str | None = None
+    table_number: str | None = None
+    title: str | None = None
+    markdown: str | None = None
+    html: str | None = None
+    html_anchor: str | None = None
+    lex_url: str | None = None
+    snippet: str | None = None
+    score: float | None = None
+
+
+class ChatExportRequest(BaseModel):
+    question: str
+    answer: str
+    format: str = Field(default="word")
+    table_html: str | None = None
+    image_urls: list[str] = Field(default_factory=list)
+    sources: list[ChatExportSourceItem] = Field(default_factory=list)
 
 
 class ChatFilterChapterItem(BaseModel):
@@ -651,6 +676,42 @@ def submit_chat_feedback(
 
     db.commit()
     return {"ok": True, "feedback_id": str(event.id), "vote": vote}
+
+
+@router.post("/export")
+def export_chat_message(payload: ChatExportRequest):
+    export_format = (payload.format or "word").strip().lower()
+    if export_format not in {"word", "pdf"}:
+        raise HTTPException(status_code=400, detail="format faqat 'word' yoki 'pdf' bo'lishi kerak.")
+
+    sources = [item.model_dump(exclude_none=True) for item in payload.sources]
+    html_document = build_chat_export_html(
+        question=payload.question,
+        answer=payload.answer,
+        table_html=payload.table_html,
+        sources=sources,
+        image_urls=payload.image_urls,
+        export_format=export_format,
+    )
+    filename_base = build_export_filename(payload.question, sources, export_format)
+
+    if export_format == "word":
+        return Response(
+            content=html_document,
+            media_type="application/msword; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename_base}.doc"',
+            },
+        )
+
+    return Response(
+        content=html_document,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename_base}.html"',
+            "X-Export-Format": "pdf-print",
+        },
+    )
 
 
 @router.post("/")
