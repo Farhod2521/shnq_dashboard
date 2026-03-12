@@ -4,7 +4,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import settings
@@ -158,6 +158,16 @@ class QAHistoryItem(BaseModel):
     answered_at: datetime | None = None
 
 
+class QAHistoryDeleteRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+
+
+class QAHistoryDeleteResponse(BaseModel):
+    ok: bool
+    deleted_count: int
+    deleted_ids: list[str]
+
+
 def _normalize_room_id(room_id: str | None) -> str | None:
     if room_id is None:
         return None
@@ -182,6 +192,29 @@ def _normalize_message_id(message_id: str) -> uuid.UUID:
         return uuid.UUID(message_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="message_id UUID formatda bo'lishi kerak.") from exc
+
+
+def _find_paired_assistant_message(db: Session, user_message: ChatMessage) -> ChatMessage | None:
+    next_user = (
+        db.query(ChatMessage)
+        .filter(
+            ChatMessage.session_id == user_message.session_id,
+            ChatMessage.role == "user",
+            ChatMessage.created_at > user_message.created_at,
+        )
+        .order_by(ChatMessage.created_at.asc())
+        .first()
+    )
+
+    query = db.query(ChatMessage).filter(
+        ChatMessage.session_id == user_message.session_id,
+        ChatMessage.role == "assistant",
+        ChatMessage.created_at > user_message.created_at,
+    )
+    if next_user:
+        query = query.filter(ChatMessage.created_at < next_user.created_at)
+
+    return query.order_by(ChatMessage.created_at.asc()).first()
 
 
 def _extract_answer_text(data: dict) -> str:
@@ -516,6 +549,74 @@ def list_qa_history(
     qa_items.sort(key=lambda item: item["asked_at"], reverse=True)
     sliced = qa_items[:limit]
     return [QAHistoryItem(**item) for item in sliced]
+
+
+@router.delete("/qa-history", response_model=QAHistoryDeleteResponse)
+def delete_qa_history_items(
+    payload: QAHistoryDeleteRequest,
+    db: Session = Depends(get_db),
+):
+    normalized_ids: list[uuid.UUID] = []
+    for raw_id in payload.ids:
+        value = (raw_id or "").strip()
+        if not value:
+            continue
+        normalized_ids.append(_normalize_message_id(value))
+
+    unique_ids: list[uuid.UUID] = list(dict.fromkeys(normalized_ids))
+    if not unique_ids:
+        raise HTTPException(status_code=400, detail="O'chirish uchun kamida bitta savol tanlang.")
+
+    deleted_ids: list[str] = []
+    affected_sessions: set[uuid.UUID] = set()
+
+    try:
+        for message_id in unique_ids:
+            user_message = (
+                db.query(ChatMessage)
+                .filter(ChatMessage.id == message_id, ChatMessage.role == "user")
+                .first()
+            )
+            if not user_message:
+                continue
+
+            assistant_message = _find_paired_assistant_message(db, user_message)
+            related_ids = [user_message.id]
+            if assistant_message:
+                related_ids.append(assistant_message.id)
+
+            db.query(FeedbackEvent).filter(
+                or_(
+                    FeedbackEvent.user_message_id.in_(related_ids),
+                    FeedbackEvent.assistant_message_id.in_(related_ids),
+                )
+            ).delete(synchronize_session=False)
+
+            if assistant_message:
+                db.delete(assistant_message)
+            db.delete(user_message)
+            affected_sessions.add(user_message.session_id)
+            deleted_ids.append(str(message_id))
+
+        for session_id in affected_sessions:
+            remaining_count = (
+                db.query(func.count(ChatMessage.id))
+                .filter(ChatMessage.session_id == session_id)
+                .scalar()
+            )
+            if int(remaining_count or 0) == 0:
+                session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+                if session:
+                    db.delete(session)
+
+        db.commit()
+        return QAHistoryDeleteResponse(ok=True, deleted_count=len(deleted_ids), deleted_ids=deleted_ids)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Savol-javobni o'chirishda xatolik: {exc}") from exc
 
 
 @router.get("/sessions", response_model=list[ChatSessionResponse])

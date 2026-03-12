@@ -937,7 +937,18 @@ function FoydalanuvchilarSahifasi({ users, onRefresh, onDelete }) {
   );
 }
 
-function SavolJavobSahifasi({ qaItems, onRefresh }) {
+function SavolJavobSahifasi({
+  qaItems,
+  onRefresh,
+  selectedIds,
+  onToggleOne,
+  onToggleAll,
+  onDeleteSelected,
+  isDeleting,
+}) {
+  const selectedCount = selectedIds.length;
+  const allSelected = qaItems.length > 0 && selectedCount === qaItems.length;
+
   return (
     <div className="flex-1 overflow-hidden flex flex-col p-6 space-y-6">
       <div className="flex items-center justify-between gap-4">
@@ -945,20 +956,48 @@ function SavolJavobSahifasi({ qaItems, onRefresh }) {
           <h1 className="text-2xl font-black text-slate-900 dark:text-slate-50 tracking-tight">Savol-javob</h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">Foydalanuvchilarning bergan savollari va tizim javoblari.</p>
         </div>
-        <button
-          onClick={onRefresh}
-          className="flex items-center justify-center h-10 w-10 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700"
-          title="Yangilash"
-        >
-          <span className="material-symbols-outlined text-[18px]">refresh</span>
-        </button>
+        <div className="flex items-center gap-3">
+          {selectedCount > 0 ? (
+            <div className="hidden sm:flex items-center rounded-lg bg-primary/10 px-3 py-2 text-xs font-bold text-primary">
+              Tanlandi: {selectedCount}
+            </div>
+          ) : null}
+          <button
+            type="button"
+            onClick={onDeleteSelected}
+            disabled={selectedCount === 0 || isDeleting}
+            className="inline-flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-bold text-red-600 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-900/40 dark:bg-red-900/20 dark:text-red-300"
+            title="Tanlanganlarni o'chirish"
+          >
+            <span className="material-symbols-outlined text-[18px]">delete</span>
+            <span>{isDeleting ? "O'chirilmoqda..." : "Tanlanganlarni o'chirish"}</span>
+          </button>
+          <button
+            onClick={onRefresh}
+            className="flex items-center justify-center h-10 w-10 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700"
+            title="Yangilash"
+          >
+            <span className="material-symbols-outlined text-[18px]">refresh</span>
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 flex flex-col overflow-hidden shadow-sm">
         <div className="flex-1 overflow-auto">
-          <table className="w-full border-collapse min-w-[1300px]">
+          <table className="w-full border-collapse min-w-[1360px]">
             <thead className="sticky top-0 bg-slate-50 dark:bg-slate-800/80 z-20">
               <tr className="text-left text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider border-b border-slate-200 dark:border-slate-700">
+                <th className="px-4 py-4 w-[56px]">
+                  <label className="inline-flex items-center justify-center">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary"
+                      checked={allSelected}
+                      onChange={(event) => onToggleAll(event.target.checked)}
+                      aria-label="Barchasini tanlash"
+                    />
+                  </label>
+                </th>
                 <th className="px-6 py-4 w-[220px]">Kim bergan</th>
                 <th className="px-6 py-4 w-[340px]">Savol</th>
                 <th className="px-6 py-4">Javob</th>
@@ -968,7 +1007,23 @@ function SavolJavobSahifasi({ qaItems, onRefresh }) {
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
               {qaItems.map((item) => (
-                <tr key={item.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/50 align-top">
+                <tr
+                  key={item.id}
+                  className={`align-top hover:bg-slate-50/80 dark:hover:bg-slate-800/50 ${
+                    selectedIds.includes(item.id) ? "bg-primary/5 dark:bg-primary/10" : ""
+                  }`}
+                >
+                  <td className="px-4 py-4">
+                    <label className="inline-flex items-center justify-center">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary"
+                        checked={selectedIds.includes(item.id)}
+                        onChange={(event) => onToggleOne(item.id, event.target.checked)}
+                        aria-label="Savol-javobni tanlash"
+                      />
+                    </label>
+                  </td>
                   <td className="px-6 py-4">
                     <div className="text-sm font-semibold text-slate-700 dark:text-slate-200">{item.askedBy || "-"}</div>
                     <div className="text-xs text-slate-500 dark:text-slate-400">{item.email || "-"}</div>
@@ -1322,6 +1377,8 @@ export default function HomePage() {
   const [categories, setCategories] = useState([]);
   const [users, setUsers] = useState([]);
   const [qaHistory, setQaHistory] = useState([]);
+  const [selectedQAIds, setSelectedQAIds] = useState([]);
+  const [isDeletingQA, setIsDeletingQA] = useState(false);
   const [dashboardStats, setDashboardStats] = useState(EMPTY_DASHBOARD_STATS);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSectionModalOpen, setIsSectionModalOpen] = useState(false);
@@ -1525,6 +1582,41 @@ export default function HomePage() {
       }
     } catch (error) {
       console.error("Savol-javoblarni olishda xatolik:", error);
+    }
+  }
+
+  async function deleteSelectedQAHistory() {
+    if (selectedQAIds.length === 0 || isDeletingQA) return;
+    const count = selectedQAIds.length;
+    if (!window.confirm(`${count} ta savol-javobni o'chirmoqchimisiz?`)) return;
+
+    try {
+      setIsDeletingQA(true);
+      const response = await fetch(`${API_BASE}/api/chat/qa-history`, {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ids: selectedQAIds }),
+      });
+      if (!response.ok) {
+        const message = await parseErrorMessage(response, "Savol-javobni o'chirishda xatolik");
+        setCornerType("error");
+        setCornerMessage(message);
+        return;
+      }
+
+      const result = await response.json();
+      await loadQAHistory();
+      setSelectedQAIds([]);
+      setCornerType("success");
+      setCornerMessage(`${result?.deleted_count ?? count} ta savol-javob o'chirildi`);
+    } catch (error) {
+      console.error("Savol-javobni o'chirishda xatolik:", error);
+      setCornerType("error");
+      setCornerMessage("Savol-javobni o'chirishda xatolik");
+    } finally {
+      setIsDeletingQA(false);
     }
   }
 
@@ -1810,6 +1902,23 @@ export default function HomePage() {
     }
   }
 
+  function toggleQASelection(id, checked) {
+    setSelectedQAIds((prev) => {
+      if (checked) {
+        return prev.includes(id) ? prev : [...prev, id];
+      }
+      return prev.filter((itemId) => itemId !== id);
+    });
+  }
+
+  function toggleAllQASelections(checked) {
+    if (checked) {
+      setSelectedQAIds(qaHistory.map((item) => item.id));
+      return;
+    }
+    setSelectedQAIds([]);
+  }
+
   useEffect(() => {
     if (!isAuthReady || !isAuthenticated) {
       return;
@@ -1832,6 +1941,10 @@ export default function HomePage() {
     const timer = window.setTimeout(() => setCornerMessage(""), 2500);
     return () => window.clearTimeout(timer);
   }, [cornerMessage]);
+
+  useEffect(() => {
+    setSelectedQAIds((prev) => prev.filter((id) => qaHistory.some((item) => item.id === id)));
+  }, [qaHistory]);
 
   const sortedDocuments = useMemo(() => {
     const data = [...documents];
@@ -2160,6 +2273,11 @@ export default function HomePage() {
           <SavolJavobSahifasi
             qaItems={qaHistory}
             onRefresh={loadQAHistory}
+            selectedIds={selectedQAIds}
+            onToggleOne={toggleQASelection}
+            onToggleAll={toggleAllQASelections}
+            onDeleteSelected={deleteSelectedQAHistory}
+            isDeleting={isDeletingQA}
           />
         ) : (
           <div className="flex-1 overflow-y-auto p-8 space-y-8 bg-background-light dark:bg-background-dark">
