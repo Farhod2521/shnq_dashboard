@@ -14,10 +14,19 @@ from app.rag.retriever import RetrievedClause, retrieve_dense_clauses, retrieve_
 
 
 WORD_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF']+")
+APOSTROPHE_VARIANTS = str.maketrans({
+    "`": "'",
+    "\u2019": "'",
+    "\u2018": "'",
+    "\u02bc": "'",
+    "\u02bb": "'",
+    "\u2032": "'",
+})
 
 
 def _normalize(text: str) -> str:
-    return " ".join((text or "").strip().lower().split())
+    lowered = (text or "").strip().lower().translate(APOSTROPHE_VARIANTS)
+    return " ".join(lowered.split())
 
 
 def _extract_terms(text: str) -> list[str]:

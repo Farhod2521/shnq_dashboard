@@ -911,6 +911,15 @@ def _query_specific_terms(text: str) -> list[str]:
     return secondary[:2]
 
 
+def _query_anchor_terms(text: str) -> list[str]:
+    specific = _query_specific_terms(text)
+    if not specific:
+        return []
+    ranked = sorted(specific, key=len, reverse=True)
+    strong = [term for term in ranked if len(term) >= 8]
+    return (strong or ranked)[:2]
+
+
 def _keyword_score(terms: list[str], text: str) -> float:
     haystack = _normalize_text(text)
     if not terms or not haystack:
@@ -938,6 +947,7 @@ def _search_clause_candidates(
 ) -> list[RetrievalItem]:
     terms = _extract_query_terms(query)
     specific_terms = _query_specific_terms(query)
+    anchor_terms = _query_anchor_terms(query)
     effective_dense_k = max(1, int(dense_k or settings.RAG_DENSE_K))
     effective_lexical_k = max(1, int(lexical_k or settings.RAG_LEXICAL_K))
     effective_rerank_candidates = max(1, int(rerank_candidates or settings.RAG_RERANK_CANDIDATES))
@@ -979,9 +989,12 @@ def _search_clause_candidates(
         semantic = float(item.dense_score or 0.0)
         keyword = _keyword_score(terms, item.snippet)
         specific_keyword = _keyword_score(specific_terms, item.snippet) if specific_terms else 0.0
+        anchor_keyword = _keyword_score(anchor_terms, item.snippet) if anchor_terms else 0.0
         if specific_terms and specific_keyword <= 0 and semantic < 0.18:
             continue
-        keyword = max(keyword, specific_keyword)
+        if anchor_terms and anchor_keyword <= 0 and semantic < 0.14:
+            continue
+        keyword = max(keyword, specific_keyword, anchor_keyword)
         if semantic < 0.02 and keyword < 0.16:
             continue
         base_score = float(item.rerank_score or item.hybrid_score or item.dense_score or item.lexical_score or 0.0)
@@ -994,6 +1007,9 @@ def _search_clause_candidates(
             numeric_score = float(numeric_match.score)
             numeric_evidence = format_numeric_evidence(numeric_match.best)
         calibrated_score = base_score * _clause_confidence_weight(semantic, keyword)
+        calibrated_score += anchor_keyword * 0.18
+        if anchor_terms and anchor_keyword <= 0 and semantic < 0.2:
+            calibrated_score *= 0.82
         if profile:
             calibrated_score += numeric_score * settings.RAG_NUMERIC_SCORE_WEIGHT
             if numeric_score <= 0.01:
@@ -1636,6 +1652,19 @@ def _merge_retrieval_candidates(primary: list[RetrievalItem], secondary: list[Re
     return out
 
 
+def _is_low_quality_top_clause(clause_items: list[RetrievalItem], query_text: str) -> bool:
+    if not clause_items:
+        return True
+    anchors = _query_anchor_terms(query_text)
+    if not anchors:
+        return False
+    top = clause_items[0]
+    anchor_hit = _keyword_score(anchors, top.snippet or "")
+    semantic = float(top.semantic_score or 0.0)
+    keyword = float(top.keyword_score or 0.0)
+    return anchor_hit <= 0 and semantic < 0.08 and keyword < 0.75
+
+
 def _route_scores_from_debug(route_debug: dict[str, object] | None) -> list[tuple[str, float]]:
     if not isinstance(route_debug, dict):
         return []
@@ -1655,6 +1684,55 @@ def _route_scores_from_debug(route_debug: dict[str, object] | None) -> list[tupl
             continue
         parsed.append((code, score))
     return parsed
+
+
+def _reprioritize_route_with_feedback(
+    selected_doc_codes: list[str],
+    route_debug: dict[str, object] | None,
+    doc_penalties: dict[str, float],
+) -> tuple[list[str], dict[str, object]]:
+    selected = _normalize_string_list(selected_doc_codes)
+    if not selected or not doc_penalties:
+        return selected, {"used": False, "reason": "empty_input_or_penalties"}
+
+    ranked = _route_scores_from_debug(route_debug)
+    if not ranked:
+        return selected, {"used": False, "reason": "missing_route_scores"}
+
+    adjusted: list[tuple[str, float, float]] = []
+    for code, score in ranked[: max(10, settings.RAG_DOC_ROUTE_TOP_K * 4)]:
+        penalty = float(doc_penalties.get(_normalize_doc_code(code), 0.0))
+        adjusted_score = float(score) * (1.0 - min(0.75, penalty))
+        adjusted.append((code, adjusted_score, penalty))
+    adjusted.sort(key=lambda x: x[1], reverse=True)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for code, _score, _penalty in adjusted:
+        key = _normalize_doc_code(code)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(code)
+        if len(out) >= settings.RAG_DOC_ROUTE_TOP_K:
+            break
+    for code in selected:
+        key = _normalize_doc_code(code)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(code)
+        if len(out) >= settings.RAG_DOC_ROUTE_TOP_K:
+            break
+    return out, {
+        "used": True,
+        "before": selected,
+        "after": out,
+        "adjusted": [
+            {"code": code, "score": round(score, 5), "penalty": round(penalty, 4)}
+            for code, score, penalty in adjusted[:8]
+        ],
+    }
 
 
 def _is_route_ambiguous(route_debug: dict[str, object] | None) -> bool:
@@ -2098,20 +2176,12 @@ def _select_context_items(query: str, items: list[RetrievalItem]) -> list[Retrie
         return items[:6]
     if not row_priority:
         clause_items = [item for item in items if item.kind == "clause"]
-        row_items = [item for item in items if item.kind == "table_row"]
         if numeric_profile.is_numeric_query and clause_items:
             clause_items = sorted(
                 clause_items,
                 key=lambda x: float(x.score or 0.0) + float(x.numeric_score or 0.0) * 0.35,
                 reverse=True,
             )
-        if _is_numeric_requirement_query(query) and row_items:
-            top_clause = clause_items[0].score if clause_items else 0.0
-            top_row = row_items[0].score
-            if top_row >= (top_clause + 0.06):
-                selected = [*row_items[:3], *clause_items[:3]]
-                selected.sort(key=lambda x: x.score, reverse=True)
-                return selected[:6]
         if clause_items:
             return clause_items[:6]
         image_items = [item for item in items if item.kind == "image"]
@@ -2415,11 +2485,21 @@ def answer_message(
         route_debug = copy.deepcopy(route_result.debug) if isinstance(route_result.debug, dict) else {}
         route_debug.setdefault("selected", list(selected_doc_codes))
 
+        if negative_feedback_signal.doc_penalties:
+            selected_doc_codes, feedback_route_debug = _reprioritize_route_with_feedback(
+                selected_doc_codes,
+                route_debug,
+                negative_feedback_signal.doc_penalties,
+            )
+            route_debug["feedback_route_penalty"] = feedback_route_debug
+            route_debug["selected"] = list(selected_doc_codes)
+
         allow_llm_disambiguation = (
             settings.RAG_DOC_ROUTE_LLM_ENABLED
             and not requested_doc_code
             and not exact_reference.document_codes
             and not filtered_doc_codes
+            and not negative_feedback_signal.doc_penalties
         )
         if allow_llm_disambiguation and _is_route_ambiguous(route_debug):
             ranked_codes = [code for code, _ in _route_scores_from_debug(route_debug)]
@@ -2560,23 +2640,30 @@ def answer_message(
                 clause_best_score = clause_items[0].score if clause_items else 0.0
                 _log_debug("deep_clause_scope_merge", query=query_text, count=len(deep_candidates), top_score=round(clause_best_score, 4))
 
+        low_quality_clause_signal = _is_low_quality_top_clause(clause_items, query_text)
         needs_global_discovery = (
             settings.RAG_DOC_ROUTE_GLOBAL_FALLBACK
             and (not requested_doc_code)
             and (not exact_reference.document_codes)
             and (not filtered_doc_codes)
-            and (not clause_items or clause_best_score < settings.RAG_STRICT_MIN_SCORE)
+            and (
+                (not clause_items)
+                or clause_best_score < settings.RAG_STRICT_MIN_SCORE
+                or low_quality_clause_signal
+            )
         )
         route_debug["global_fallback"] = {
             "enabled": settings.RAG_DOC_ROUTE_GLOBAL_FALLBACK,
             "triggered": bool(needs_global_discovery),
             "top_clause_score_before": round(float(clause_best_score), 4),
+            "low_quality_clause_signal": bool(low_quality_clause_signal),
         }
         if needs_global_discovery:
             global_filters = copy.deepcopy(metadata_filters)
             global_filters.document_codes = []
             global_candidates: list[RetrievalItem] = []
             global_passes = 3 if settings.RAG_DEEP_CLAUSE_DISCOVERY else 1
+            global_merge_weight = 1.06 if low_quality_clause_signal else 0.96
             for idx, expanded_query in enumerate(query_expansions[:global_passes]):
                 expanded_vec = query_vec if idx == 0 else _embed_for_query(expanded_query)
                 try:
@@ -2598,15 +2685,16 @@ def answer_message(
                 except Exception as exc:
                     _log_debug("global_clause_discovery_failed", query=expanded_query, error=f"{type(exc).__name__}: {exc}")
                     continue
-                global_candidates = _merge_retrieval_candidates(global_candidates, global_items, secondary_weight=0.96)
+                global_candidates = _merge_retrieval_candidates(global_candidates, global_items, secondary_weight=global_merge_weight)
             if global_candidates:
-                clause_items = _merge_retrieval_candidates(clause_items, global_candidates, secondary_weight=0.96)
+                clause_items = _merge_retrieval_candidates(clause_items, global_candidates, secondary_weight=global_merge_weight)
                 clause_best_score = clause_items[0].score if clause_items else 0.0
                 _log_debug("global_clause_discovery_merge", query=query_text, count=len(global_candidates), top_score=round(clause_best_score, 4))
                 route_debug["global_fallback"] = {
                     "enabled": settings.RAG_DOC_ROUTE_GLOBAL_FALLBACK,
                     "triggered": True,
                     "merged_candidates": len(global_candidates),
+                    "merge_weight": round(global_merge_weight, 3),
                     "top_clause_score_after": round(float(clause_best_score), 4),
                 }
 
@@ -2617,7 +2705,8 @@ def answer_message(
         numeric_requirement = _is_numeric_requirement_query(query_text)
         allow_table_search = (table_intent or row_priority) and not explicit_clause_lookup
         soft_table_probe = (
-            (not allow_table_search)
+            settings.RAG_ENABLE_SOFT_TABLE_PROBE
+            and (not allow_table_search)
             and numeric_requirement
             and (not explicit_clause_lookup)
             and clause_best_score < settings.RAG_RICH_SOURCE_CLAUSE_THRESHOLD

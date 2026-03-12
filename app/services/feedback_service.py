@@ -322,12 +322,12 @@ def get_negative_feedback_signal(db: Session, question: str) -> NegativeFeedback
     doc_penalties: dict[str, float] = {}
     source_penalties: set[str] = set()
     for row in rows:
-        base = 0.08
-        repeat_boost = min(0.14, max(0, int(row.rejected_count or 1) - 1) * 0.03)
+        base = 0.12
+        repeat_boost = min(0.28, max(0, int(row.rejected_count or 1) - 1) * 0.05)
         penalty = base + repeat_boost
         doc_key = _normalize_doc_code(row.document_code)
         if doc_key:
-            doc_penalties[doc_key] = min(0.32, doc_penalties.get(doc_key, 0.0) + penalty)
+            doc_penalties[doc_key] = min(0.58, doc_penalties.get(doc_key, 0.0) + penalty)
         for source_id in row.rejected_source_ids or []:
             if isinstance(source_id, str) and source_id.strip():
                 source_penalties.add(source_id.strip())
