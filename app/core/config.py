@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     RAG_DOC_ROUTE_TOP_K: int = 3
     RAG_DOC_ROUTE_DENSE_K: int = 50
     RAG_DOC_ROUTE_MIN_SCORE: float = 0.12
+    RAG_DOC_ROUTE_LLM_ENABLED: bool = True
+    RAG_DOC_ROUTE_LLM_MODEL: str = "gpt-4.1-mini"
+    RAG_DOC_ROUTE_LLM_MAX_CANDIDATES: int = 5
+    RAG_DOC_ROUTE_CLOSE_RATIO: float = 0.9
+    RAG_DOC_ROUTE_LOW_CONFIDENCE: float = 0.22
+    RAG_DOC_ROUTE_GLOBAL_FALLBACK: bool = True
     RAG_ENABLE_UNIFIED_RERANK: bool = True
     RAG_DUPLICATE_SIM_THRESHOLD: float = 0.9
     RAG_DEEP_CLAUSE_DISCOVERY: bool = True

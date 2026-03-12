@@ -4,7 +4,9 @@ from app.rag.reference_parser import ExactReference
 from app.services.chat_service import (
     RetrievalItem,
     _clean_fewshot_text,
+    _extract_doc_choice_from_text,
     _has_fewshot_mojibake,
+    _is_route_ambiguous,
     _pick_exact_clause_candidate,
 )
 from app.utils.text_fix import repair_mojibake
@@ -61,6 +63,22 @@ class ChatAccuracyGuardsTests(unittest.TestCase):
         ]
         picked = _pick_exact_clause_candidate(items, ref, requested_doc_code="SHNQ 2.01.05-24")
         self.assertIsNone(picked)
+
+    def test_extract_doc_choice_from_json(self) -> None:
+        picked = _extract_doc_choice_from_text(
+            '{"code":"SHNQ 2.01.05-24"}',
+            ["SHNQ 2.01.05-24", "SHNQ 2.04.01-22"],
+        )
+        self.assertEqual(picked, "SHNQ 2.01.05-24")
+
+    def test_route_ambiguity_detects_close_scores(self) -> None:
+        debug = {
+            "scores": [
+                {"code": "SHNQ 2.01.05-24", "score": 0.28},
+                {"code": "SHNQ 2.04.01-22", "score": 0.27},
+            ]
+        }
+        self.assertTrue(_is_route_ambiguous(debug))
 
 
 if __name__ == "__main__":

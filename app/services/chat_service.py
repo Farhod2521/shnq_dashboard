@@ -1636,6 +1636,117 @@ def _merge_retrieval_candidates(primary: list[RetrievalItem], secondary: list[Re
     return out
 
 
+def _route_scores_from_debug(route_debug: dict[str, object] | None) -> list[tuple[str, float]]:
+    if not isinstance(route_debug, dict):
+        return []
+    raw_scores = route_debug.get("scores")
+    if not isinstance(raw_scores, list):
+        return []
+    parsed: list[tuple[str, float]] = []
+    for row in raw_scores:
+        if not isinstance(row, dict):
+            continue
+        code = (row.get("code") or "").strip()
+        if not code:
+            continue
+        try:
+            score = float(row.get("score") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        parsed.append((code, score))
+    return parsed
+
+
+def _is_route_ambiguous(route_debug: dict[str, object] | None) -> bool:
+    ranked = _route_scores_from_debug(route_debug)
+    if len(ranked) < 2:
+        return False
+    top_score = float(ranked[0][1])
+    second_score = float(ranked[1][1])
+    gap_close = (top_score - second_score) <= settings.RAG_AMBIGUITY_SCORE_GAP
+    ratio_close = (second_score / max(top_score, 1e-6)) >= settings.RAG_DOC_ROUTE_CLOSE_RATIO
+    low_confidence = top_score < settings.RAG_DOC_ROUTE_LOW_CONFIDENCE
+    return bool(gap_close or ratio_close or low_confidence)
+
+
+def _extract_doc_choice_from_text(raw_text: str, candidates: list[str]) -> str | None:
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    compact = text.strip("`").strip()
+    if compact.startswith("json"):
+        compact = compact[4:].strip()
+    allowed = {_normalize_doc_code(code): code for code in candidates if code}
+
+    try:
+        parsed = json.loads(compact)
+        if isinstance(parsed, dict):
+            candidate = parsed.get("code")
+            if isinstance(candidate, str):
+                key = _normalize_doc_code(candidate)
+                if key in allowed:
+                    return allowed[key]
+    except Exception:
+        pass
+
+    normalized_text = _normalize_doc_code(compact)
+    for key, original in allowed.items():
+        if key and key in normalized_text:
+            return original
+    return None
+
+
+def _disambiguate_route_with_llm(
+    db: Session,
+    query_text: str,
+    candidates: list[str],
+) -> tuple[str | None, dict[str, object]]:
+    unique_candidates = _normalize_string_list(candidates)[: max(2, settings.RAG_DOC_ROUTE_LLM_MAX_CANDIDATES)]
+    if len(unique_candidates) < 2:
+        return None, {"used": False, "reason": "insufficient_candidates"}
+
+    rows = db.query(Document).filter(Document.code.in_(unique_candidates)).all()
+    title_map = {row.code: row.title for row in rows if row.code}
+    candidate_lines = [
+        f"- {code}: {(title_map.get(code, '') or '').strip()[:180]}"
+        for code in unique_candidates
+    ]
+    system = (
+        "Siz SHNQ hujjat-router assistentsiz. "
+        "Faqat berilgan kandidat hujjatlardan eng mos bittasini tanlang. "
+        "Javob faqat JSON bo'lsin: {\"code\":\"<candidate>\"}. "
+        "Agar hech biri mos bo'lmasa {\"code\":\"\"} qaytaring."
+    )
+    prompt = (
+        f"Savol:\n{query_text}\n\n"
+        f"Kandidat hujjatlar:\n{chr(10).join(candidate_lines)}\n\n"
+        "Faqat bitta eng mos code tanlang."
+    )
+    try:
+        raw = generate_text(
+            prompt=prompt,
+            system=system,
+            model=settings.RAG_DOC_ROUTE_LLM_MODEL,
+            options={"temperature": 0.0, "top_p": 0.9, "max_tokens": 80},
+        )
+        picked = _extract_doc_choice_from_text(raw, unique_candidates)
+        return picked, {
+            "used": bool(picked),
+            "model": settings.RAG_DOC_ROUTE_LLM_MODEL,
+            "candidates": unique_candidates,
+            "selected": picked,
+            "raw": (raw or "").strip()[:200],
+        }
+    except Exception as exc:
+        return None, {
+            "used": False,
+            "model": settings.RAG_DOC_ROUTE_LLM_MODEL,
+            "candidates": unique_candidates,
+            "reason": "llm_error",
+            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+        }
+
+
 def _should_ask_document_clarification(items: list[RetrievalItem], best_score: float) -> tuple[bool, list[str]]:
     if len(items) < 2:
         return False, []
@@ -2300,7 +2411,30 @@ def answer_message(
             requested_doc_code=requested_doc_code,
             explicit_doc_codes=[*filtered_doc_codes, *exact_reference.document_codes],
         )
-        selected_doc_codes = route_result.document_codes
+        selected_doc_codes = _normalize_string_list(route_result.document_codes)
+        route_debug = copy.deepcopy(route_result.debug) if isinstance(route_result.debug, dict) else {}
+        route_debug.setdefault("selected", list(selected_doc_codes))
+
+        allow_llm_disambiguation = (
+            settings.RAG_DOC_ROUTE_LLM_ENABLED
+            and not requested_doc_code
+            and not exact_reference.document_codes
+            and not filtered_doc_codes
+        )
+        if allow_llm_disambiguation and _is_route_ambiguous(route_debug):
+            ranked_codes = [code for code, _ in _route_scores_from_debug(route_debug)]
+            llm_candidates = _normalize_string_list([*selected_doc_codes, *ranked_codes])
+            llm_choice, llm_debug = _disambiguate_route_with_llm(db, query_text, llm_candidates)
+            route_debug["llm_disambiguation"] = llm_debug
+            if llm_choice:
+                selected_doc_codes = [llm_choice, *[code for code in selected_doc_codes if _normalize_doc_code(code) != _normalize_doc_code(llm_choice)]]
+                route_debug["selected"] = list(selected_doc_codes)
+        else:
+            route_debug["llm_disambiguation"] = {
+                "used": False,
+                "reason": "disabled_or_not_ambiguous",
+            }
+
         metadata_filters = _build_metadata_filters(intent_result, exact_reference, selected_doc_codes)
         if filtered_metadata.section_ids:
             metadata_filters.section_ids = _normalize_string_list([*(metadata_filters.section_ids or []), *filtered_metadata.section_ids])
@@ -2313,7 +2447,7 @@ def answer_message(
             "document_route",
             query=query_text,
             selected_doc_codes=selected_doc_codes,
-            route_debug=route_result.debug,
+            route_debug=route_debug,
             numeric_query=query_profile.is_numeric_query,
             numeric_comparator=query_profile.comparator,
             metadata_filters={
@@ -2427,17 +2561,23 @@ def answer_message(
                 _log_debug("deep_clause_scope_merge", query=query_text, count=len(deep_candidates), top_score=round(clause_best_score, 4))
 
         needs_global_discovery = (
-            (not requested_doc_code)
+            settings.RAG_DOC_ROUTE_GLOBAL_FALLBACK
+            and (not requested_doc_code)
             and (not exact_reference.document_codes)
             and (not filtered_doc_codes)
-            and intent_result.intent in {"topical_search", "general_synthesis"}
             and (not clause_items or clause_best_score < settings.RAG_STRICT_MIN_SCORE)
         )
-        if needs_global_discovery and settings.RAG_DEEP_CLAUSE_DISCOVERY:
+        route_debug["global_fallback"] = {
+            "enabled": settings.RAG_DOC_ROUTE_GLOBAL_FALLBACK,
+            "triggered": bool(needs_global_discovery),
+            "top_clause_score_before": round(float(clause_best_score), 4),
+        }
+        if needs_global_discovery:
             global_filters = copy.deepcopy(metadata_filters)
             global_filters.document_codes = []
             global_candidates: list[RetrievalItem] = []
-            for idx, expanded_query in enumerate(query_expansions[:3]):
+            global_passes = 3 if settings.RAG_DEEP_CLAUSE_DISCOVERY else 1
+            for idx, expanded_query in enumerate(query_expansions[:global_passes]):
                 expanded_vec = query_vec if idx == 0 else _embed_for_query(expanded_query)
                 try:
                     global_items = _search_clause_candidates(
@@ -2447,10 +2587,13 @@ def answer_message(
                         doc_codes=None,
                         metadata_filters=global_filters,
                         numeric_profile=query_profile,
-                        dense_k=max(settings.RAG_DENSE_K * deep_multiplier, settings.RAG_DOC_ROUTE_DENSE_K),
-                        lexical_k=max(settings.RAG_LEXICAL_K * deep_multiplier, settings.RAG_DOC_ROUTE_DENSE_K),
-                        rerank_candidates=max(settings.RAG_RERANK_CANDIDATES * deep_multiplier, settings.RAG_RERANK_CANDIDATES + 30),
-                        top_k=max(settings.RAG_TOP_K * deep_multiplier, settings.RAG_TOP_K + 8),
+                        dense_k=max(settings.RAG_DENSE_K * (deep_multiplier if settings.RAG_DEEP_CLAUSE_DISCOVERY else 1), settings.RAG_DOC_ROUTE_DENSE_K),
+                        lexical_k=max(settings.RAG_LEXICAL_K * (deep_multiplier if settings.RAG_DEEP_CLAUSE_DISCOVERY else 1), settings.RAG_DOC_ROUTE_DENSE_K),
+                        rerank_candidates=max(
+                            settings.RAG_RERANK_CANDIDATES * (deep_multiplier if settings.RAG_DEEP_CLAUSE_DISCOVERY else 1),
+                            settings.RAG_RERANK_CANDIDATES + 30,
+                        ),
+                        top_k=max(settings.RAG_TOP_K * (deep_multiplier if settings.RAG_DEEP_CLAUSE_DISCOVERY else 1), settings.RAG_TOP_K + 8),
                     )
                 except Exception as exc:
                     _log_debug("global_clause_discovery_failed", query=expanded_query, error=f"{type(exc).__name__}: {exc}")
@@ -2460,6 +2603,12 @@ def answer_message(
                 clause_items = _merge_retrieval_candidates(clause_items, global_candidates, secondary_weight=0.96)
                 clause_best_score = clause_items[0].score if clause_items else 0.0
                 _log_debug("global_clause_discovery_merge", query=query_text, count=len(global_candidates), top_score=round(clause_best_score, 4))
+                route_debug["global_fallback"] = {
+                    "enabled": settings.RAG_DOC_ROUTE_GLOBAL_FALLBACK,
+                    "triggered": True,
+                    "merged_candidates": len(global_candidates),
+                    "top_clause_score_after": round(float(clause_best_score), 4),
+                }
 
         normalized_query = _normalize_text(query_text)
         row_priority = _is_table_row_priority_query(query_text)
@@ -2549,7 +2698,7 @@ def answer_message(
             feedback_penalty_docs=len(negative_feedback_signal.doc_penalties),
             feedback_penalty_sources=len(negative_feedback_signal.source_penalties),
         )
-        return clause_items, row_items, image_items, selected_doc_codes, metadata_filters, route_result.debug
+        return clause_items, row_items, image_items, selected_doc_codes, metadata_filters, route_debug
 
     clause_items, row_items, image_items, selected_docs_primary, _metadata_filters_primary, route_debug_primary = compute_candidates(rewritten_primary)
     primary_best_score = clause_items[0].score if clause_items else 0.0
