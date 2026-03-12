@@ -14,10 +14,57 @@ else:
 
 
 WORD_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF']+")
+APOSTROPHE_VARIANTS = str.maketrans({
+    "`": "'",
+    "\u2019": "'",
+    "\u2018": "'",
+    "\u02bc": "'",
+    "\u02bb": "'",
+    "\u2032": "'",
+})
 
 
 def _tokenize(text: str) -> list[str]:
-    return [w.lower() for w in WORD_RE.findall(text or "") if len(w) > 2]
+    normalized = (text or "").lower().translate(APOSTROPHE_VARIANTS)
+    return [_stem_token(w) for w in WORD_RE.findall(normalized) if len(w) > 2]
+
+
+def _stem_token(token: str) -> str:
+    value = (token or "").strip().lower().translate(APOSTROPHE_VARIANTS)
+    suffixes = (
+        "larining",
+        "laridan",
+        "larida",
+        "lariga",
+        "larini",
+        "larning",
+        "lardan",
+        "sigacha",
+        "igacha",
+        "sidan",
+        "idan",
+        "gacha",
+        "lari",
+        "ning",
+        "dagi",
+        "dan",
+        "lar",
+        "gan",
+        "si",
+        "ga",
+        "da",
+        "ni",
+        "i",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if value.endswith(suffix) and len(value) - len(suffix) >= 4:
+                value = value[: -len(suffix)]
+                changed = True
+                break
+    return value
 
 
 def _fingerprint(text: str) -> str:

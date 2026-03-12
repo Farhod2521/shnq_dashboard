@@ -74,6 +74,16 @@ def assess_confidence(
         if conflicting:
             warning = "Top results point to multiple documents with close evidence."
 
+    if conflicting and top_sem < 0.15 and float(numeric_signal or 0.0) < 0.05:
+        return ConfidenceResult(
+            score=signal,
+            label="low",
+            no_answer=True,
+            reason="conflicting_low_semantic_evidence",
+            conflicting_evidence=conflicting,
+            warning=warning,
+        )
+
     # Exact reference queries should fail safely if no exact match exists.
     if intent.intent == "exact_band_reference" and reference.clause_numbers:
         target = {value.strip().lower() for value in reference.clause_numbers}

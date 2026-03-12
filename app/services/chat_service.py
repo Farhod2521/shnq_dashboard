@@ -630,10 +630,40 @@ def _needs_clarification(text: str) -> tuple[str, str] | None:
 
 
 def _stem_query_token(token: str) -> str:
-    value = token.lower()
-    for suffix in ("lardan", "larning", "larga", "larni", "ning", "dan", "ga", "da", "ni", "lar", "si", "i"):
-        if value.endswith(suffix) and len(value) - len(suffix) >= 4:
-            return value[: -len(suffix)]
+    value = token.lower().translate(APOSTROPHE_VARIANTS)
+    suffixes = (
+        "larining",
+        "laridan",
+        "larida",
+        "lariga",
+        "larini",
+        "larning",
+        "lardan",
+        "sigacha",
+        "igacha",
+        "sidan",
+        "idan",
+        "gacha",
+        "lari",
+        "ning",
+        "dagi",
+        "dan",
+        "lar",
+        "gan",
+        "si",
+        "ga",
+        "da",
+        "ni",
+        "i",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if value.endswith(suffix) and len(value) - len(suffix) >= 4:
+                value = value[: -len(suffix)]
+                changed = True
+                break
     return value
 
 
@@ -1583,9 +1613,11 @@ def _build_rag_prompt(
         parts = [f"Namuna {i}\nSavol: {x['question']}\nJavob: {x['answer']}" for i, x in enumerate(fewshot_examples, start=1)]
         fewshot_block = "\n\nJavob uslubi namunalari:\n" + "\n\n".join(parts)
     detailed_label, short_label = _answer_labels(response_language)
+    anchor_terms = _query_anchor_terms(question)
     doc_list_instruction = ""
     table_instruction = ""
     compare_instruction = ""
+    anchor_instruction = ""
     if _is_document_list_request(question):
         doc_list_instruction = " Agar savolda qaysi SHNQ/hujjat so'ralgan bo'lsa, kontekstdagi SHNQ kodlarini to'liq ro'yxat qilib bering."
     if _is_table_intent_query(question):
@@ -1595,6 +1627,11 @@ def _build_rag_prompt(
         )
     if intent and intent.intent == "compare_documents":
         compare_instruction = " Taqqoslash savollarida har bir hujjat bo'yicha dalilni alohida ko'rsatib, farqini qisqa xulosa qiling."
+    if anchor_terms:
+        anchor_instruction = (
+            f" Savoldagi asosiy obyekt/kalit atamalar: {', '.join(anchor_terms)}. "
+            "Javobni faqat shu obyektga haqiqatan mos manbaga tayanib yozing; bu atamalar bilan bog'liq bo'lmagan manbani asos qilib olmang."
+        )
     numeric_instruction = (
         " Numeric savollarda (minimal/maksimal/kamida/ko'pi bilan/qancha) kontekstdagi eng mos son+birlikni tanlang. "
         "Agar bir nechta qiymat bo'lsa, savoldagi obyektga semantik jihatdan eng mos bandni tanlang va shu bandni ko'rsating."
@@ -1623,7 +1660,7 @@ def _build_rag_prompt(
         "Har bir manba alohida hujjatdan olingan.\n"
         "Eng mos manbani tanlab javob bering.\n\n"
 
-        f"{doc_list_instruction}{table_instruction}{compare_instruction}{numeric_instruction}"
+        f"{doc_list_instruction}{table_instruction}{compare_instruction}{anchor_instruction}{numeric_instruction}"
     )
     prompt = (
         f"Savol: {question}\n\nKontekst:\n{context}{fewshot_block}\n\n"
@@ -1662,7 +1699,29 @@ def _is_low_quality_top_clause(clause_items: list[RetrievalItem], query_text: st
     anchor_hit = _keyword_score(anchors, top.snippet or "")
     semantic = float(top.semantic_score or 0.0)
     keyword = float(top.keyword_score or 0.0)
-    return anchor_hit <= 0 and semantic < 0.08 and keyword < 0.75
+    return anchor_hit <= 0 and (semantic < 0.7 or keyword < 0.82)
+
+
+def _filter_items_by_query_anchors(query_text: str, items: list[RetrievalItem]) -> list[RetrievalItem]:
+    if not items:
+        return []
+    anchors = _query_anchor_terms(query_text)
+    if not anchors:
+        return items
+
+    kept: list[RetrievalItem] = []
+    rejected: list[RetrievalItem] = []
+    for item in items:
+        haystack = " ".join(part for part in [item.title or "", item.chapter or "", item.snippet or ""] if part)
+        anchor_hit = _keyword_score(anchors, haystack)
+        semantic = float(item.semantic_score or 0.0)
+        keyword = float(item.keyword_score or 0.0)
+        numeric = float(item.numeric_score or 0.0)
+        if anchor_hit > 0 or semantic >= 0.78 or (numeric >= 0.45 and keyword >= 0.45):
+            kept.append(item)
+        else:
+            rejected.append(item)
+    return kept if kept else items
 
 
 def _route_scores_from_debug(route_debug: dict[str, object] | None) -> list[tuple[str, float]]:
@@ -2485,21 +2544,11 @@ def answer_message(
         route_debug = copy.deepcopy(route_result.debug) if isinstance(route_result.debug, dict) else {}
         route_debug.setdefault("selected", list(selected_doc_codes))
 
-        if negative_feedback_signal.doc_penalties:
-            selected_doc_codes, feedback_route_debug = _reprioritize_route_with_feedback(
-                selected_doc_codes,
-                route_debug,
-                negative_feedback_signal.doc_penalties,
-            )
-            route_debug["feedback_route_penalty"] = feedback_route_debug
-            route_debug["selected"] = list(selected_doc_codes)
-
         allow_llm_disambiguation = (
             settings.RAG_DOC_ROUTE_LLM_ENABLED
             and not requested_doc_code
             and not exact_reference.document_codes
             and not filtered_doc_codes
-            and not negative_feedback_signal.doc_penalties
         )
         if allow_llm_disambiguation and _is_route_ambiguous(route_debug):
             ranked_codes = [code for code, _ in _route_scores_from_debug(route_debug)]
@@ -2515,6 +2564,8 @@ def answer_message(
                 "reason": "disabled_or_not_ambiguous",
             }
 
+        hard_doc_scope = bool(requested_doc_code or exact_reference.document_codes or filtered_doc_codes)
+        retrieval_doc_codes = selected_doc_codes if hard_doc_scope else None
         metadata_filters = _build_metadata_filters(intent_result, exact_reference, selected_doc_codes)
         if filtered_metadata.section_ids:
             metadata_filters.section_ids = _normalize_string_list([*(metadata_filters.section_ids or []), *filtered_metadata.section_ids])
@@ -2527,6 +2578,8 @@ def answer_message(
             "document_route",
             query=query_text,
             selected_doc_codes=selected_doc_codes,
+            retrieval_doc_codes=retrieval_doc_codes,
+            hard_doc_scope=hard_doc_scope,
             route_debug=route_debug,
             numeric_query=query_profile.is_numeric_query,
             numeric_comparator=query_profile.comparator,
@@ -2544,14 +2597,14 @@ def answer_message(
             exact_clause_items = _search_exact_clause_references(
                 db=db,
                 reference=exact_reference,
-                document_codes=selected_doc_codes,
+                document_codes=retrieval_doc_codes,
                 metadata_filters=metadata_filters,
             )
         clause_items = _search_clause_candidates(
             db=db,
             query=query_text,
             query_vec=query_vec,
-            doc_codes=selected_doc_codes,
+            doc_codes=retrieval_doc_codes,
             metadata_filters=metadata_filters,
             numeric_profile=query_profile,
         )
@@ -2560,11 +2613,11 @@ def answer_message(
 
         if not clause_items:
             raw_q = db.query(Clause).options(joinedload(Clause.document))
-            if selected_doc_codes:
-                if len(selected_doc_codes) == 1:
-                    raw_q = raw_q.filter(Clause.document.has(code=selected_doc_codes[0]))
+            if retrieval_doc_codes:
+                if len(retrieval_doc_codes) == 1:
+                    raw_q = raw_q.filter(Clause.document.has(code=retrieval_doc_codes[0]))
                 else:
-                    raw_q = raw_q.filter(Clause.document.has(Document.code.in_(selected_doc_codes)))
+                    raw_q = raw_q.filter(Clause.document.has(Document.code.in_(retrieval_doc_codes)))
             raw_rows = raw_q.order_by(Clause.order).limit(4000).all()
             words = _extract_query_terms(query_text)
             keyword_hits: list[RetrievalItem] = []
@@ -2623,7 +2676,7 @@ def answer_message(
                         db=db,
                         query=expanded_query,
                         query_vec=expanded_vec,
-                        doc_codes=selected_doc_codes,
+                        doc_codes=retrieval_doc_codes,
                         metadata_filters=metadata_filters,
                         numeric_profile=query_profile,
                         dense_k=max(settings.RAG_DENSE_K * deep_multiplier, settings.RAG_DENSE_K + 20),
@@ -2698,6 +2751,9 @@ def answer_message(
                     "top_clause_score_after": round(float(clause_best_score), 4),
                 }
 
+        clause_items = _filter_items_by_query_anchors(query_text, clause_items)
+        clause_best_score = clause_items[0].score if clause_items else 0.0
+
         normalized_query = _normalize_text(query_text)
         row_priority = _is_table_row_priority_query(query_text)
         table_intent = intent_result.intent == "table_lookup" or _is_table_intent_query(query_text)
@@ -2721,7 +2777,7 @@ def answer_message(
                 db,
                 query_text,
                 query_vec,
-                selected_doc_codes,
+                retrieval_doc_codes,
                 metadata_filters=metadata_filters,
                 row_priority=row_priority,
                 limit_override=row_top_k,
@@ -2738,7 +2794,7 @@ def answer_message(
                 row_fallback = _search_table_row_keyword_fallback(
                     db,
                     query_text,
-                    selected_doc_codes,
+                    retrieval_doc_codes,
                     limit=max(row_top_k, 8),
                     metadata_filters=metadata_filters,
                 )
@@ -2748,7 +2804,7 @@ def answer_message(
         image_intent = intent_result.intent == "image_lookup" or any(h in normalized_query for h in ["rasm", "image", "diagramma", "sxema", "surat", "chizma"])
         need_image_sources = image_intent or clause_best_score < settings.RAG_MIN_SCORE
         image_items = (
-            _search_image_candidates(db, query_text, query_vec, selected_doc_codes, metadata_filters=metadata_filters)
+            _search_image_candidates(db, query_text, query_vec, retrieval_doc_codes, metadata_filters=metadata_filters)
             if need_image_sources
             else []
         )
@@ -2774,6 +2830,7 @@ def answer_message(
                 negative_feedback_signal.doc_penalties,
                 negative_feedback_signal.source_penalties,
             )
+            clause_items = _filter_items_by_query_anchors(query_text, clause_items)
             clause_best_score = clause_items[0].score if clause_items else 0.0
         _log_debug(
             "candidate_counts",

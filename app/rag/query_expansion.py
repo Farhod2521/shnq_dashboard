@@ -5,6 +5,15 @@ import re
 from app.rag.numeric_reasoner import NumericQueryProfile
 from app.rag.reference_parser import ExactReference
 
+_SYNONYM_MAP: dict[str, tuple[str, ...]] = {
+    "ko'kalamzor": ("yashil hudud", "yashil maydon", "ko'kalamzor hudud"),
+    "ko'kalamzorlashtiril": ("yashil hudud", "yashil maydon", "ko'kalamzor hudud"),
+    "ulush": ("foiz", "maydon ulushi"),
+    "hojatxona": ("tualet", "hovli tualeti", "tashqi hojatxona"),
+    "hovli": ("tomorqa", "uy oldi hududi"),
+    "turar joy": ("uy", "yashash binosi"),
+}
+
 
 def _normalize(text: str) -> str:
     return " ".join((text or "").strip().lower().replace("\u2019", "'").replace("`", "'").split())
@@ -73,5 +82,12 @@ def expand_clause_discovery_queries(
         if profile.property_terms:
             term_block = " ".join(profile.property_terms[:2])
             expansions.append(f"{base} {term_block} normasi")
+
+    normalized_base = _normalize(base)
+    for key, variants in _SYNONYM_MAP.items():
+        if key not in normalized_base:
+            continue
+        for variant in variants:
+            expansions.append(normalized_base.replace(key, variant))
 
     return _dedupe(expansions)[:6]

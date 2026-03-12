@@ -29,8 +29,48 @@ def _normalize(text: str) -> str:
     return " ".join(lowered.split())
 
 
+def _stem_token(token: str) -> str:
+    value = (token or "").strip().lower().translate(APOSTROPHE_VARIANTS)
+    suffixes = (
+        "larining",
+        "laridan",
+        "larida",
+        "lariga",
+        "larini",
+        "larning",
+        "lardan",
+        "lariga",
+        "sigacha",
+        "igacha",
+        "sidan",
+        "idan",
+        "gacha",
+        "lari",
+        "ning",
+        "dagi",
+        "dagi",
+        "dan",
+        "lar",
+        "gan",
+        "si",
+        "ga",
+        "da",
+        "ni",
+        "i",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if value.endswith(suffix) and len(value) - len(suffix) >= 4:
+                value = value[: -len(suffix)]
+                changed = True
+                break
+    return value
+
+
 def _extract_terms(text: str) -> list[str]:
-    values = [token.lower() for token in WORD_RE.findall(_normalize(text))]
+    values = [_stem_token(token) for token in WORD_RE.findall(_normalize(text))]
     out: list[str] = []
     for token in values:
         if len(token) <= 2:
@@ -118,6 +158,15 @@ def route_documents(
         document_code=None,
         limit=max(settings.RAG_DENSE_K, settings.RAG_DOC_ROUTE_DENSE_K),
     )
+    if not dense_hits:
+        from app.rag.retriever import retrieve_db_dense_fallback
+
+        dense_hits = retrieve_db_dense_fallback(
+            db=db,
+            query_vec=query_vec,
+            document_code=None,
+            limit=max(settings.RAG_DENSE_K, settings.RAG_DOC_ROUTE_DENSE_K),
+        )
     dense_scores = _aggregate_doc_scores(dense_hits, "dense_score")
 
     lexical_scores_from_clauses: dict[str, float] = {}

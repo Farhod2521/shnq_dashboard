@@ -18,6 +18,14 @@ from app.utils.text_fix import repair_mojibake, to_cp1251_mojibake
 
 WORD_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF']+")
 logger = logging.getLogger(__name__)
+APOSTROPHE_VARIANTS = str.maketrans({
+    "`": "'",
+    "\u2019": "'",
+    "\u2018": "'",
+    "\u02bc": "'",
+    "\u02bb": "'",
+    "\u2032": "'",
+})
 
 
 @dataclass
@@ -43,8 +51,46 @@ class RetrievedClause:
 def _tokenize(text: str) -> list[str]:
     if not text:
         return []
-    normalized = repair_mojibake(text)
-    return [w.lower() for w in WORD_RE.findall(normalized) if len(w) > 2]
+    normalized = repair_mojibake(text).lower().translate(APOSTROPHE_VARIANTS)
+    return [_stem_token(w) for w in WORD_RE.findall(normalized) if len(w) > 2]
+
+
+def _stem_token(token: str) -> str:
+    value = (token or "").strip().lower().translate(APOSTROPHE_VARIANTS)
+    suffixes = (
+        "larining",
+        "laridan",
+        "larida",
+        "lariga",
+        "larini",
+        "larning",
+        "lardan",
+        "sigacha",
+        "igacha",
+        "sidan",
+        "idan",
+        "gacha",
+        "lari",
+        "ning",
+        "dagi",
+        "dan",
+        "lar",
+        "gan",
+        "si",
+        "ga",
+        "da",
+        "ni",
+        "i",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if value.endswith(suffix) and len(value) - len(suffix) >= 4:
+                value = value[: -len(suffix)]
+                changed = True
+                break
+    return value
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -164,7 +210,12 @@ def retrieve_lexical_clauses(
         return []
     doc_codes = _normalize_doc_codes(document_code, document_codes)
 
-    unique_terms = list(dict.fromkeys(terms))[:8]
+    raw_query_terms = [
+        _stem_token(token)
+        for token in WORD_RE.findall(repair_mojibake(query).lower().translate(APOSTROPHE_VARIANTS))
+        if len(token) > 2
+    ]
+    unique_terms = list(dict.fromkeys([*terms, *raw_query_terms]))[:10]
     mojibake_terms = [
         variant
         for variant in (to_cp1251_mojibake(term) for term in unique_terms)
@@ -192,7 +243,8 @@ def retrieve_lexical_clauses(
     results: list[RetrievedClause] = []
     for row in rows:
         text = row.text or ""
-        text_fixed = repair_mojibake(text).lower()
+        chapter_title = row.chapter.title if row.chapter else ""
+        text_fixed = repair_mojibake(f"{chapter_title} {text}").lower().translate(APOSTROPHE_VARIANTS)
         text_raw = text.lower()
 
         tf_clean = sum(text_fixed.count(term) for term in unique_terms)
