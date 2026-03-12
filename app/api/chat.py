@@ -14,9 +14,11 @@ from app.models.chat_message import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.chat_user import ChatUser
 from app.models.document import Document
+from app.models.feedback_event import FeedbackEvent
 from app.models.section import Section
 from app.services.auth_service import extract_bearer_token, get_user_by_token
 from app.services.chat_service import ChatQueryFilters, answer_message
+from app.services.feedback_service import upsert_rejected_qa, upsert_verified_qa
 
 
 router = APIRouter()
@@ -49,6 +51,13 @@ class ChatMessageRequest(BaseModel):
     session_id: str | None = None
     room_id: str | None = None
     filters: ChatFilterSelection | None = None
+
+
+class ChatFeedbackRequest(BaseModel):
+    message_id: str
+    vote: str
+    reason: str | None = None
+    room_id: str | None = None
 
 
 class ChatFilterChapterItem(BaseModel):
@@ -141,6 +150,13 @@ def _normalize_session_id(session_id: str) -> uuid.UUID:
         return uuid.UUID(session_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="session_id UUID formatda bo'lishi kerak.") from exc
+
+
+def _normalize_message_id(message_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(message_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="message_id UUID formatda bo'lishi kerak.") from exc
 
 
 def _extract_answer_text(data: dict) -> str:
@@ -557,6 +573,86 @@ def get_session_messages(
     )
 
 
+@router.post("/feedback")
+def submit_chat_feedback(
+    payload: ChatFeedbackRequest,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    normalized_message_id = _normalize_message_id(payload.message_id)
+    vote = (payload.vote or "").strip().lower()
+    if vote not in {"up", "down"}:
+        raise HTTPException(status_code=400, detail="vote faqat 'up' yoki 'down' bo'lishi kerak.")
+
+    user = _get_optional_user(db, authorization)
+    normalized_room = _normalize_room_id(payload.room_id)
+
+    assistant_message = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.id == normalized_message_id, ChatMessage.role == "assistant")
+        .first()
+    )
+    if not assistant_message:
+        raise HTTPException(status_code=404, detail="Assistant message topilmadi.")
+
+    session = db.query(ChatSession).filter(ChatSession.id == assistant_message.session_id).first()
+    effective_room = normalized_room
+    if effective_room is None and session and session.user_id is None:
+        effective_room = session.guest_room_id
+    _check_session_access(session=session, user=user, room_id=effective_room)
+
+    user_message = (
+        db.query(ChatMessage)
+        .filter(
+            ChatMessage.session_id == assistant_message.session_id,
+            ChatMessage.role == "user",
+            ChatMessage.created_at <= assistant_message.created_at,
+        )
+        .order_by(ChatMessage.created_at.desc())
+        .first()
+    )
+
+    question_text = (user_message.content if user_message else "").strip()
+    answer_text = (assistant_message.content or "").strip()
+    if not question_text or not answer_text:
+        raise HTTPException(status_code=400, detail="Feedback uchun savol yoki javob bo'sh.")
+    sources = assistant_message.sources if isinstance(assistant_message.sources, list) else []
+    reason = (payload.reason or "").strip() or None
+
+    event = FeedbackEvent(
+        session_id=assistant_message.session_id,
+        assistant_message_id=assistant_message.id,
+        user_message_id=user_message.id if user_message else None,
+        vote=vote,
+        question=question_text,
+        answer=answer_text,
+        reason=reason,
+        model_output=answer_text,
+        retrieval_context=sources,
+        top_sources=sources[:5] if isinstance(sources, list) else None,
+    )
+    db.add(event)
+
+    if vote == "up":
+        upsert_verified_qa(
+            db=db,
+            question=question_text,
+            answer=answer_text,
+            sources=sources,
+        )
+    else:
+        upsert_rejected_qa(
+            db=db,
+            question=question_text,
+            answer=answer_text,
+            sources=sources,
+            reason=reason,
+        )
+
+    db.commit()
+    return {"ok": True, "feedback_id": str(event.id), "vote": vote}
+
+
 @router.post("/")
 def chat_message(
     payload: ChatMessageRequest,
@@ -645,6 +741,8 @@ def chat_message(
 
         result["session_id"] = str(session.id)
         result["room_id"] = session.guest_room_id
+        result["user_message_id"] = str(user_message.id)
+        result["assistant_message_id"] = str(assistant_message.id)
         return result
     except ValueError as exc:
         db.rollback()

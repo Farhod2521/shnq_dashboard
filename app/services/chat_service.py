@@ -52,6 +52,10 @@ from app.services.llm_service import (
     generate_text,
     translate_query_for_search,
 )
+from app.services.feedback_service import (
+    find_verified_answer_hit,
+    get_negative_feedback_signal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1852,6 +1856,52 @@ def _source_from_item(item: RetrievalItem) -> dict[str, object]:
     }
 
 
+def _feedback_source_id_from_item(item: RetrievalItem) -> str:
+    doc = _normalize_doc_code(item.shnq_code)
+    if item.kind == "clause":
+        ref = (item.clause_number or item.html_anchor or "").strip().lower()
+        return f"clause:{doc}:{ref}"
+    if item.kind == "table_row":
+        ref = (item.table_number or "").strip().lower()
+        row_index = item.row_index if item.row_index is not None else ""
+        return f"table_row:{doc}:{ref}:{row_index}"
+    if item.kind == "image":
+        ref = (item.appendix_number or item.image_url or "").strip().lower()
+        return f"image:{doc}:{ref}"
+    ref = (item.table_number or item.title or "").strip().lower()
+    return f"{item.kind}:{doc}:{ref}"
+
+
+def _apply_feedback_penalties(
+    items: list[RetrievalItem],
+    doc_penalties: dict[str, float],
+    source_penalties: set[str],
+) -> list[RetrievalItem]:
+    if not items:
+        return []
+    if not doc_penalties and not source_penalties:
+        return items
+
+    adjusted: list[RetrievalItem] = []
+    for item in items:
+        penalty = 0.0
+        doc_key = _normalize_doc_code(item.shnq_code)
+        if doc_key:
+            penalty += float(doc_penalties.get(doc_key, 0.0))
+        source_key = _feedback_source_id_from_item(item)
+        if source_key in source_penalties:
+            penalty += 0.16
+        penalty = min(0.55, penalty)
+        if penalty <= 0:
+            adjusted.append(item)
+            continue
+        scored = copy.deepcopy(item)
+        scored.score = max(0.0, float(scored.score or 0.0) * (1.0 - penalty))
+        adjusted.append(scored)
+    adjusted.sort(key=lambda x: x.score, reverse=True)
+    return adjusted
+
+
 def _get_pretranslated_table_content(table: NormTable, language: str) -> tuple[str, str]:
     target = (language or "uz").lower()
     if target == "en" and ((table.raw_html_en or "").strip() or (table.markdown_en or "").strip()):
@@ -2198,6 +2248,28 @@ def answer_message(
         _attach_timing_meta(meta, timings, started_at)
         return {"answer": answer, "sources": [source], "table_html": table_html, "image_urls": [], "meta": meta}
 
+    if not filters_active:
+        verified_hit = find_verified_answer_hit(
+            db=db,
+            question=search_message,
+            requested_doc_code=requested_doc_code,
+        )
+        if verified_hit:
+            cached_sources = verified_hit.row.source_payload if isinstance(verified_hit.row.source_payload, list) else []
+            answer = ensure_answer_language(verified_hit.row.answer or "", detected_language)
+            meta = {
+                "type": "verified_cache",
+                "mode": verified_hit.mode,
+                "similarity": round(float(verified_hit.similarity), 4),
+                "model": settings.CHAT_MODEL,
+                "query_language": detected_language,
+                "document_code": verified_hit.row.document_code,
+            }
+            _attach_timing_meta(meta, timings, started_at)
+            return {"answer": answer, "sources": cached_sources, "table_html": None, "image_urls": [], "meta": meta}
+
+    negative_feedback_signal = get_negative_feedback_signal(db, search_message)
+
     non_uz_query = detected_language in {"en", "ru", "ko"}
     translated_search_message = search_message if non_uz_query else None
     primary_query_message = original_message if (non_uz_query and settings.RAG_MULTILINGUAL_NATIVE_FIRST) else search_message
@@ -2448,6 +2520,23 @@ def answer_message(
                 for item in image_items
                 if item.score >= max(settings.RAG_IMAGE_MIN_SCORE + 0.08, 0.3)
             ]
+        if negative_feedback_signal.doc_penalties or negative_feedback_signal.source_penalties:
+            clause_items = _apply_feedback_penalties(
+                clause_items,
+                negative_feedback_signal.doc_penalties,
+                negative_feedback_signal.source_penalties,
+            )
+            row_items = _apply_feedback_penalties(
+                row_items,
+                negative_feedback_signal.doc_penalties,
+                negative_feedback_signal.source_penalties,
+            )
+            image_items = _apply_feedback_penalties(
+                image_items,
+                negative_feedback_signal.doc_penalties,
+                negative_feedback_signal.source_penalties,
+            )
+            clause_best_score = clause_items[0].score if clause_items else 0.0
         _log_debug(
             "candidate_counts",
             query=query_text,
@@ -2457,6 +2546,8 @@ def answer_message(
             top_clause_score=round(clause_best_score, 4),
             numeric_query=query_profile.is_numeric_query,
             query_expansions=query_expansions,
+            feedback_penalty_docs=len(negative_feedback_signal.doc_penalties),
+            feedback_penalty_sources=len(negative_feedback_signal.source_penalties),
         )
         return clause_items, row_items, image_items, selected_doc_codes, metadata_filters, route_result.debug
 
