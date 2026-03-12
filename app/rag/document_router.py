@@ -164,6 +164,7 @@ def route_documents(
         dense_hits = retrieve_db_dense_fallback(
             db=db,
             query_vec=query_vec,
+            query_text=query,
             document_code=None,
             limit=max(settings.RAG_DENSE_K, settings.RAG_DOC_ROUTE_DENSE_K),
         )

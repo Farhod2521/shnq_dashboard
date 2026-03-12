@@ -281,6 +281,8 @@ def retrieve_lexical_clauses(
         if variant and variant not in unique_terms
     ]
     all_search_terms = list(dict.fromkeys([*unique_terms, *mojibake_terms]))
+    fetch_limit = max(limit * 40, 1600)
+    broad_limit = max(limit * 70, 3200)
 
     def _fetch_rows(search_terms: list[str]) -> list[Clause]:
         if not search_terms:
@@ -289,7 +291,7 @@ def retrieve_lexical_clauses(
         db_q = db.query(Clause).options(joinedload(Clause.document), joinedload(Clause.chapter))
         if doc_codes:
             db_q = db_q.filter(Clause.document.has(Document.code.in_(doc_codes)))
-        return db_q.filter(or_(*ilike_filters)).order_by(Clause.order).all()
+        return db_q.filter(or_(*ilike_filters)).order_by(Clause.order).limit(fetch_limit).all()
 
     rows = _fetch_rows(priority_search_terms or all_search_terms)
     if len(rows) < max(24, limit * 3) and priority_search_terms and priority_search_terms != all_search_terms:
@@ -302,7 +304,7 @@ def retrieve_lexical_clauses(
         if doc_codes:
             broad_q = broad_q.filter(Clause.document.has(Document.code.in_(doc_codes)))
         row_map = {str(row.id): row for row in rows}
-        for row in broad_q.order_by(Clause.order).limit(max(limit * 120, 6000)).all():
+        for row in broad_q.order_by(Clause.order).limit(broad_limit).all():
             row_map.setdefault(str(row.id), row)
         rows = list(row_map.values())
 
@@ -358,6 +360,7 @@ def retrieve_lexical_clauses(
 def retrieve_db_dense_fallback(
     db: Session,
     query_vec: list[float],
+    query_text: str | None,
     document_code: str | None,
     limit: int,
     document_codes: list[str] | None = None,
@@ -366,13 +369,23 @@ def retrieve_db_dense_fallback(
     if not query_vec:
         return []
     doc_codes = _normalize_doc_codes(document_code, document_codes)
+    lexical_limit = max(limit * 30, 900)
+    lexical_seed = retrieve_lexical_clauses(
+        db=db,
+        query=query_text or "",
+        document_code=document_code,
+        document_codes=document_codes,
+        metadata_filters=metadata_filters,
+        limit=lexical_limit,
+    )
+    candidate_ids = [item.clause_id for item in lexical_seed if item.clause_id]
+    if not candidate_ids:
+        return []
 
     db_q = db.query(ClauseEmbedding).options(
         joinedload(ClauseEmbedding.clause).joinedload(Clause.document),
         joinedload(ClauseEmbedding.clause).joinedload(Clause.chapter),
-    )
-    if doc_codes:
-        db_q = db_q.filter(ClauseEmbedding.shnq_code.in_(doc_codes))
+    ).filter(ClauseEmbedding.clause_id.in_(candidate_ids))
 
     heap: list[tuple[float, int, RetrievedClause]] = []
     ordinal = 0

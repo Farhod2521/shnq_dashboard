@@ -1005,6 +1005,7 @@ def _search_clause_candidates(
         dense = retrieve_db_dense_fallback(
             db=db,
             query_vec=query_vec,
+            query_text=query,
             document_code=None,
             document_codes=doc_codes,
             metadata_filters=metadata_filters,
