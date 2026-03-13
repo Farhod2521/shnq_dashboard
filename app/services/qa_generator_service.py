@@ -15,8 +15,9 @@ from app.models.document import Document
 from app.models.norm_table import NormTable
 from app.models.qa_generated_draft import QAGeneratedDraft
 from app.models.qa_generation_job import QAGenerationJob
+from app.models.rejected_qa import RejectedQA
 from app.models.verified_qa import VerifiedQA
-from app.services.feedback_service import normalize_question, upsert_verified_qa
+from app.services.feedback_service import normalize_question, upsert_rejected_qa, upsert_verified_qa
 from app.services.llm_service import embed_text, generate_json
 
 
@@ -537,9 +538,17 @@ def _generate_batch(
 
 def _existing_questions_for_document(db: Session, document_id: uuid.UUID) -> set[str]:
     existing: set[str] = set()
+    document = db.query(Document).filter(Document.id == document_id).first()
     draft_questions = db.query(QAGeneratedDraft.question).filter(QAGeneratedDraft.document_id == document_id).all()
     verified_questions = db.query(VerifiedQA.original_question).filter(VerifiedQA.document_id == document_id).all()
-    for (value,) in [*draft_questions, *verified_questions]:
+    rejected_questions = []
+    if document and document.code:
+        rejected_questions = (
+            db.query(RejectedQA.original_question)
+            .filter(RejectedQA.document_code == document.code)
+            .all()
+        )
+    for (value,) in [*draft_questions, *verified_questions, *rejected_questions]:
         if value:
             existing.add(normalize_question(value))
     return existing
@@ -821,6 +830,14 @@ def reject_draft(db: Session, draft_id: str, review_note: str | None = None) -> 
     if draft.status == "approved":
         raise ValueError("Approved bo'lgan draftni reject qilib bo'lmaydi.")
     job = db.query(QAGenerationJob).filter(QAGenerationJob.id == draft.job_id).first()
+    sources = _build_draft_sources(db, draft)
+    upsert_rejected_qa(
+        db=db,
+        question=draft.question,
+        answer=draft.answer,
+        sources=sources,
+        reason=review_note or "qa_generator_reject_delete",
+    )
     deleted_id = str(draft.id)
     db.delete(draft)
     db.flush()

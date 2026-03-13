@@ -479,6 +479,47 @@ def _is_table_direct_lookup_request(message: str) -> bool:
     return not any(hint in normalized for hint in TABLE_QUESTION_HINTS)
 
 
+def _has_explicit_table_reference(text: str) -> bool:
+    normalized = _normalize_text(text)
+    return bool(_extract_table_number(normalized) or _extract_appendix_number(normalized))
+
+
+def _needs_table_number_clarification(text: str) -> bool:
+    normalized = _normalize_text(text)
+    return bool(TABLE_TYPO_RE.search(normalized)) and not _has_explicit_table_reference(normalized)
+
+
+def _build_table_number_clarification_response(
+    db: Session,
+    message: str,
+    requested_doc_code: str | None,
+    filtered_doc_codes: list[str] | None,
+    detected_language: str,
+    timings: dict[str, float],
+    started_at: float,
+) -> dict[str, object] | None:
+    if not _needs_table_number_clarification(message):
+        return None
+    table_doc_code = requested_doc_code or (filtered_doc_codes[0] if filtered_doc_codes and len(filtered_doc_codes) == 1 else None)
+    candidate_tables = _document_table_options(db, table_doc_code) if table_doc_code else []
+    meta = {
+        "type": "clarification",
+        "missing_case": "missing_table_number",
+        "model": settings.CHAT_MODEL,
+        "query_language": detected_language,
+    }
+    if candidate_tables:
+        meta["candidate_tables"] = candidate_tables
+    _attach_timing_meta(meta, timings, started_at)
+    return {
+        "answer": _build_missing_table_number_answer(table_doc_code, candidate_tables),
+        "sources": [],
+        "table_html": None,
+        "image_urls": [],
+        "meta": meta,
+    }
+
+
 def _is_explicit_clause_lookup(text: str) -> bool:
     return bool(CLAUSE_LOOKUP_RE.search(text or ""))
 
@@ -2448,7 +2489,7 @@ def answer_message(
         filter_debug=filter_debug,
     )
 
-    if _is_table_request(search_message) or intent_result.intent == "table_lookup":
+    if _has_explicit_table_reference(search_message) and (_is_table_request(search_message) or intent_result.intent == "table_lookup"):
         table, table_number, doc_code, candidates = _find_table_for_query(db, search_message, requested_doc_code)
         if filtered_doc_codes:
             allowed_doc_codes = {_normalize_doc_code(code) for code in filtered_doc_codes if code}
@@ -3084,6 +3125,17 @@ def answer_message(
             if requested_doc_code
             else "Savolga mos band aniq topilmadi"
         )
+        table_clarification = _build_table_number_clarification_response(
+            db,
+            search_message,
+            requested_doc_code,
+            filtered_doc_codes,
+            detected_language,
+            timings,
+            started_at,
+        )
+        if table_clarification:
+            return table_clarification
         message_text = _no_answer_with_filter_hint(filters_active, fallback=fallback)
         meta = {
             "type": "no_match",
@@ -3115,6 +3167,17 @@ def answer_message(
             }
             _attach_timing_meta(meta, timings, started_at)
             return {"answer": answer_text, "sources": rescue_sources, "table_html": None, "image_urls": [], "meta": meta}
+        table_clarification = _build_table_number_clarification_response(
+            db,
+            search_message,
+            requested_doc_code,
+            filtered_doc_codes,
+            detected_language,
+            timings,
+            started_at,
+        )
+        if table_clarification:
+            return table_clarification
         clarification = _needs_clarification(search_message)
         if clarification:
             code, question = clarification
@@ -3218,6 +3281,17 @@ def answer_message(
                 filters_active,
                 fallback=f"{', '.join(exact_reference.clause_numbers)} band bo'yicha aniq moslik topilmadi",
             )
+        table_clarification = _build_table_number_clarification_response(
+            db,
+            search_message,
+            requested_doc_code,
+            filtered_doc_codes,
+            detected_language,
+            timings,
+            started_at,
+        )
+        if table_clarification:
+            return table_clarification
         meta = {
             "type": "no_match",
             "reason": confidence.reason,
@@ -3231,6 +3305,17 @@ def answer_message(
     merged = _select_context_items(original_message, merged_all)
     _hydrate_clause_items(db, merged)
     if not merged:
+        table_clarification = _build_table_number_clarification_response(
+            db,
+            search_message,
+            requested_doc_code,
+            filtered_doc_codes,
+            detected_language,
+            timings,
+            started_at,
+        )
+        if table_clarification:
+            return table_clarification
         meta = {"type": "no_match", "model": settings.CHAT_MODEL, "query_language": detected_language}
         _attach_timing_meta(meta, timings, started_at)
         return {
