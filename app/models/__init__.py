@@ -16,6 +16,8 @@ from app.models.norm_table import NormTable
 from app.models.norm_table_cell import NormTableCell
 from app.models.norm_table_row import NormTableRow
 from app.models.question_answer import QuestionAnswer
+from app.models.qa_generated_draft import QAGeneratedDraft
+from app.models.qa_generation_job import QAGenerationJob
 from app.models.rejected_qa import RejectedQA
 from app.models.section import Section
 from app.models.table_row_embedding import TableRowEmbedding
@@ -40,6 +42,8 @@ __all__ = [
     "NormTableCell",
     "NormTableRow",
     "QuestionAnswer",
+    "QAGeneratedDraft",
+    "QAGenerationJob",
     "RejectedQA",
     "Section",
     "TableRowEmbedding",

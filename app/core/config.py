@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_API_KEY: str | None = None
     QDRANT_COLLECTION: str = "clause_embeddings_bge_m3"
+    QDRANT_VERIFIED_QA_COLLECTION: str = "verified_qa_bge_m3"
     RAG_USE_QDRANT: bool = True
     RAG_TOP_K: int = 8
     RAG_MIN_SCORE: float = 0.15
@@ -73,6 +74,15 @@ class Settings(BaseSettings):
     RAG_DEBUG_LOGGING: bool = True
     PIPELINE_MAX_PARALLEL: int = 2
     EMBEDDING_TIMEOUT_SECONDS: int = 60
+    VERIFIED_QA_SEMANTIC_LIMIT: int = 5000
+    VERIFIED_QA_SEMANTIC_MIN_SCORE: float = 0.9
+    VERIFIED_QA_SEMANTIC_CANDIDATES: int = 32
+    QA_GENERATOR_MODEL: str = "gpt-5-mini"
+    QA_GENERATOR_PROMPT_VERSION: str = "v1"
+    QA_GENERATOR_BATCH_SIZE: int = 6
+    QA_GENERATOR_MAX_CONTEXT_ITEMS: int = 18
+    QA_GENERATOR_MAX_CLAUSE_CHARS: int = 850
+    QA_GENERATOR_MAX_TABLE_CHARS: int = 1400
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import QAGeneratorPage from "../components/QAGeneratorPage";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://shnq-api.dashboard.iqmath.uz";
 const AUTH_SESSION_KEY = "shnq_dashboard_static_auth";
@@ -1406,6 +1407,7 @@ export default function HomePage() {
   const isDocumentsPage = pathname === "/documents";
   const isUsersPage = pathname === "/users";
   const isQAPage = pathname === "/qa";
+  const isQAGeneratorPage = pathname === "/qa-generator";
 
   useEffect(() => {
     const session = window.localStorage.getItem(AUTH_SESSION_KEY);
@@ -2059,12 +2061,15 @@ export default function HomePage() {
         action: loadQAHistory,
       };
     }
+    if (isQAGeneratorPage) {
+      return null;
+    }
     return {
       icon: "upload_file",
       label: "Hujjat yaratish",
       action: openCreateDocumentModal,
     };
-  }, [isCategoriesPage, isSectionsPage, isUsersPage, isQAPage]);
+  }, [isCategoriesPage, isSectionsPage, isUsersPage, isQAPage, isQAGeneratorPage]);
 
   async function refreshAll() {
     await Promise.all([loadDocuments(), loadTaxonomy()]);
@@ -2178,6 +2183,10 @@ export default function HomePage() {
             <span className="material-symbols-outlined">forum</span>
             <span className="text-sm">Savol-javob</span>
           </Link>
+          <Link href="/qa-generator" className={`w-full text-left flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors ${isQAGeneratorPage ? "bg-primary/10 text-primary font-semibold" : "text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800"}`}>
+            <span className="material-symbols-outlined">auto_awesome</span>
+            <span className="text-sm">AI Generator</span>
+          </Link>
           <a className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors" href="#">
             <span className="material-symbols-outlined">monitoring</span>
             <span className="text-sm">Monitoring</span>
@@ -2192,12 +2201,14 @@ export default function HomePage() {
           </a>
         </nav>
 
-        <div className="p-4 border-t border-slate-200 dark:border-slate-800">
-          <button onClick={quickActionConfig.action} className="w-full bg-primary hover:bg-primary/90 text-white font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 transition-all shadow-sm">
-            <span className="material-symbols-outlined text-lg">{quickActionConfig.icon}</span>
-            <span className="text-sm">{quickActionConfig.label}</span>
-          </button>
-        </div>
+        {quickActionConfig ? (
+          <div className="p-4 border-t border-slate-200 dark:border-slate-800">
+            <button onClick={quickActionConfig.action} className="w-full bg-primary hover:bg-primary/90 text-white font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 transition-all shadow-sm">
+              <span className="material-symbols-outlined text-lg">{quickActionConfig.icon}</span>
+              <span className="text-sm">{quickActionConfig.label}</span>
+            </button>
+          </div>
+        ) : null}
       </aside>
 
       <main className="flex-1 flex flex-col overflow-hidden">
@@ -2279,6 +2290,8 @@ export default function HomePage() {
             onDeleteSelected={deleteSelectedQAHistory}
             isDeleting={isDeletingQA}
           />
+        ) : isQAGeneratorPage ? (
+          <QAGeneratorPage apiBase={API_BASE} />
         ) : (
           <div className="flex-1 overflow-y-auto p-8 space-y-8 bg-background-light dark:bg-background-dark">
             <div className="flex items-center justify-between">

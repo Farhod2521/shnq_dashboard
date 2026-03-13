@@ -2613,7 +2613,8 @@ def answer_message(
         _attach_timing_meta(meta, timings, started_at)
         return {"answer": answer, "sources": [source], "table_html": table_html, "image_urls": [], "meta": meta}
 
-    if not filters_active:
+    skip_verified_cache = bool(exact_reference.has_explicit_reference)
+    if not filters_active and not skip_verified_cache:
         verified_hit = find_verified_answer_hit(
             db=db,
             question=search_message,
@@ -2622,6 +2623,12 @@ def answer_message(
         if verified_hit:
             cached_sources = verified_hit.row.source_payload if isinstance(verified_hit.row.source_payload, list) else []
             answer = ensure_answer_language(verified_hit.row.answer or "", detected_language)
+            cached_table_html = None
+            for source in cached_sources:
+                if isinstance(source, dict) and (source.get("type") or "").strip().lower() == "table":
+                    cached_table_html = source.get("html")
+                    if cached_table_html:
+                        break
             meta = {
                 "type": "verified_cache",
                 "mode": verified_hit.mode,
@@ -2631,7 +2638,7 @@ def answer_message(
                 "document_code": verified_hit.row.document_code,
             }
             _attach_timing_meta(meta, timings, started_at)
-            return {"answer": answer, "sources": cached_sources, "table_html": None, "image_urls": [], "meta": meta}
+            return {"answer": answer, "sources": cached_sources, "table_html": cached_table_html, "image_urls": [], "meta": meta}
 
     negative_feedback_signal = get_negative_feedback_signal(db, search_message)
 

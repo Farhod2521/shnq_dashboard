@@ -11,18 +11,43 @@ def _client() -> QdrantClient:
     return QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
 
 
-def _ensure_collection(vector_size: int):
+def _ensure_collection(collection_name: str, vector_size: int):
     client = _client()
     try:
         collections = {c.name for c in client.get_collections().collections}
-        if settings.QDRANT_COLLECTION in collections:
+        if collection_name in collections:
             return
         client.create_collection(
-            collection_name=settings.QDRANT_COLLECTION,
+            collection_name=collection_name,
             vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
         )
     except Exception:
         # Qdrant vaqtincha ishlamasa pipeline to'xtab qolmasin.
+        return
+
+
+def upsert_vector(
+    *,
+    collection_name: str,
+    point_id: str,
+    vector: list[float],
+    payload: dict[str, object] | None = None,
+):
+    if not settings.RAG_USE_QDRANT or not vector:
+        return
+    try:
+        _ensure_collection(collection_name, len(vector))
+        _client().upsert(
+            collection_name=collection_name,
+            points=[
+                PointStruct(
+                    id=point_id,
+                    vector=vector,
+                    payload=payload or {},
+                )
+            ],
+        )
+    except Exception:
         return
 
 
@@ -38,32 +63,53 @@ def upsert_clause_embedding(
     language: str | None = None,
     content_type: str | None = None,
 ):
-    if not settings.RAG_USE_QDRANT or not vector:
-        return
-    try:
-        _ensure_collection(len(vector))
-        _client().upsert(
-            collection_name=settings.QDRANT_COLLECTION,
-            points=[
-                PointStruct(
-                    id=clause_id,
-                    vector=vector,
-                    payload={
-                        "source_type": "clause",
-                        "shnq_code": shnq_code,
-                        "clause_number": clause_number,
-                        "chapter_title": chapter_title,
-                        "document_id": document_id,
-                        "section_id": section_id,
-                        "page": page,
-                        "language": language,
-                        "content_type": content_type,
-                    },
-                )
-            ],
-        )
-    except Exception:
-        return
+    upsert_vector(
+        collection_name=settings.QDRANT_COLLECTION,
+        point_id=clause_id,
+        vector=vector,
+        payload={
+            "source_type": "clause",
+            "shnq_code": shnq_code,
+            "clause_number": clause_number,
+            "chapter_title": chapter_title,
+            "document_id": document_id,
+            "section_id": section_id,
+            "page": page,
+            "language": language,
+            "content_type": content_type,
+        },
+    )
+
+
+def upsert_verified_qa_embedding(
+    qa_id: str,
+    vector: list[float],
+    *,
+    shnq_code: str | None = None,
+    document_id: str | None = None,
+    table_id: str | None = None,
+    table_number: str | None = None,
+    has_table: bool | None = None,
+    chapter_title: str | None = None,
+    clause_number: str | None = None,
+    origin_type: str | None = None,
+):
+    upsert_vector(
+        collection_name=settings.QDRANT_VERIFIED_QA_COLLECTION,
+        point_id=qa_id,
+        vector=vector,
+        payload={
+            "source_type": "verified_qa",
+            "shnq_code": shnq_code,
+            "document_id": document_id,
+            "table_id": table_id,
+            "table_number": table_number,
+            "has_table": has_table,
+            "chapter_title": chapter_title,
+            "clause_number": clause_number,
+            "origin_type": origin_type,
+        },
+    )
 
 
 def _build_filter(
@@ -101,7 +147,9 @@ def _build_filter(
     return Filter(must=must) if must else None
 
 
-def search_clause_ids(
+def search_vectors(
+    *,
+    collection_name: str,
     query_vector: list[float],
     limit: int = 8,
     shnq_code: str | None = None,
@@ -114,7 +162,7 @@ def search_clause_ids(
 
     try:
         hits = _client().search(
-            collection_name=settings.QDRANT_COLLECTION,
+            collection_name=collection_name,
             query_vector=query_vector,
             query_filter=q_filter,
             limit=limit,
@@ -122,3 +170,37 @@ def search_clause_ids(
         return [(str(hit.id), float(hit.score)) for hit in hits]
     except Exception:
         return []
+
+
+def search_clause_ids(
+    query_vector: list[float],
+    limit: int = 8,
+    shnq_code: str | None = None,
+    shnq_codes: list[str] | None = None,
+    metadata_filters: dict[str, list[str]] | None = None,
+) -> list[tuple[str, float]]:
+    return search_vectors(
+        collection_name=settings.QDRANT_COLLECTION,
+        query_vector=query_vector,
+        limit=limit,
+        shnq_code=shnq_code,
+        shnq_codes=shnq_codes,
+        metadata_filters=metadata_filters,
+    )
+
+
+def search_verified_qa_ids(
+    query_vector: list[float],
+    limit: int = 8,
+    shnq_code: str | None = None,
+    shnq_codes: list[str] | None = None,
+    metadata_filters: dict[str, list[str]] | None = None,
+) -> list[tuple[str, float]]:
+    return search_vectors(
+        collection_name=settings.QDRANT_VERIFIED_QA_COLLECTION,
+        query_vector=query_vector,
+        limit=limit,
+        shnq_code=shnq_code,
+        shnq_codes=shnq_codes,
+        metadata_filters=metadata_filters,
+    )

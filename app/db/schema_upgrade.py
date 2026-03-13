@@ -49,3 +49,58 @@ def ensure_section_category_schema(engine: Engine) -> None:
                 "ON categories (section_id, code)"
             )
         )
+
+
+def ensure_qa_generator_schema(engine: Engine) -> None:
+    if engine.dialect.name != "postgresql":
+        return
+
+    inspector = inspect(engine)
+    if not inspector.has_table("verified_qa"):
+        return
+
+    with engine.begin() as conn:
+        statements = [
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS document_id UUID",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS chapter_title VARCHAR(500)",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS clause_number VARCHAR(64)",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS has_table BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS table_id UUID",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS table_number VARCHAR(64)",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS table_title VARCHAR(500)",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS lex_url TEXT",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS source_anchor VARCHAR(128)",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS source_excerpt TEXT",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS origin_type VARCHAR(32)",
+            "ALTER TABLE verified_qa ADD COLUMN IF NOT EXISTS generation_job_id UUID",
+        ]
+        for statement in statements:
+            conn.execute(text(statement))
+
+        conn.execute(text("UPDATE verified_qa SET has_table = FALSE WHERE has_table IS NULL"))
+        conn.execute(text("UPDATE verified_qa SET origin_type = 'feedback' WHERE origin_type IS NULL"))
+
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_verified_qa_document_id "
+                "ON verified_qa (document_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_verified_qa_clause_number "
+                "ON verified_qa (clause_number)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_verified_qa_table_number "
+                "ON verified_qa (table_number)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_verified_qa_origin_type "
+                "ON verified_qa (origin_type)"
+            )
+        )

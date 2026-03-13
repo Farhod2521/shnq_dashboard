@@ -5,14 +5,17 @@ import json
 import math
 import re
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.rejected_qa import RejectedQA
 from app.models.verified_qa import VerifiedQA
 from app.services.llm_service import embed_text
+from app.services.qdrant_service import search_verified_qa_ids, upsert_verified_qa_embedding
 from app.utils.text_fix import repair_mojibake
 
 _APOSTROPHE_VARIANTS = str.maketrans(
@@ -51,6 +54,15 @@ def normalize_question(text: str) -> str:
 
 def _normalize_doc_code(value: str | None) -> str:
     return re.sub(r"\s+", "", (value or "").strip().lower())
+
+
+def _parse_uuid_or_none(value: str | None):
+    if not value:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _safe_embed(value: str) -> list[float]:
@@ -111,6 +123,16 @@ def primary_document_code(sources: list | None) -> str | None:
     return None
 
 
+def primary_document_id(sources: list | None) -> str | None:
+    for src in sources or []:
+        if not isinstance(src, dict):
+            continue
+        value = (src.get("document_id") or "").strip()
+        if value:
+            return value
+    return None
+
+
 def short_answer(answer: str) -> str:
     text = (answer or "").strip()
     if not text:
@@ -136,11 +158,29 @@ def upsert_verified_qa(
     sources: list | None,
     language: str | None = None,
     intent_type: str | None = None,
+    short_answer_override: str | None = None,
+    document_id: str | None = None,
+    document_code: str | None = None,
+    chapter_title: str | None = None,
+    clause_number: str | None = None,
+    has_table: bool | None = None,
+    table_id: str | None = None,
+    table_number: str | None = None,
+    table_title: str | None = None,
+    lex_url: str | None = None,
+    source_anchor: str | None = None,
+    source_excerpt: str | None = None,
+    origin_type: str | None = None,
+    generation_job_id: str | None = None,
 ) -> VerifiedQA:
     normalized = normalize_question(question)
     ids = source_ids_from_payload(sources)
-    doc_code = primary_document_code(sources)
+    doc_code = document_code or primary_document_code(sources)
+    doc_id = _parse_uuid_or_none(document_id or primary_document_id(sources))
+    parsed_table_id = _parse_uuid_or_none(table_id)
+    parsed_generation_job_id = _parse_uuid_or_none(generation_job_id)
     hash_value = _source_hash(ids)
+    embedding = _safe_embed(question)
     row = (
         db.query(VerifiedQA)
         .filter(
@@ -159,25 +199,78 @@ def upsert_verified_qa(
         row.updated_at = now
         row.source_payload = sources or []
         row.source_ids = ids
+        row.short_answer = (short_answer_override or row.short_answer or short_answer(answer))[:400]
         if language:
             row.language = language
         if intent_type:
             row.intent_type = intent_type
         if doc_code:
             row.document_code = doc_code
+        if doc_id:
+            row.document_id = doc_id
+        if chapter_title:
+            row.chapter_title = chapter_title
+        if clause_number:
+            row.clause_number = clause_number
+        if has_table is not None:
+            row.has_table = has_table
+        if table_id:
+            row.table_id = parsed_table_id
+        if table_number:
+            row.table_number = table_number
+        if table_title:
+            row.table_title = table_title
+        if lex_url:
+            row.lex_url = lex_url
+        if source_anchor:
+            row.source_anchor = source_anchor
+        if source_excerpt:
+            row.source_excerpt = source_excerpt
+        if origin_type:
+            row.origin_type = origin_type
+        if generation_job_id:
+            row.generation_job_id = parsed_generation_job_id
+        if embedding:
+            row.embedding = embedding
+        db.flush()
+        if row.embedding:
+            upsert_verified_qa_embedding(
+                str(row.id),
+                row.embedding,
+                shnq_code=row.document_code,
+                document_id=str(row.document_id) if row.document_id else None,
+                table_id=str(row.table_id) if row.table_id else None,
+                table_number=row.table_number,
+                has_table=row.has_table,
+                chapter_title=row.chapter_title,
+                clause_number=row.clause_number,
+                origin_type=row.origin_type,
+            )
         return row
 
     row = VerifiedQA(
         normalized_question=normalized,
         original_question=question,
         answer=answer,
-        short_answer=short_answer(answer),
+        short_answer=(short_answer_override or short_answer(answer))[:400],
+        document_id=doc_id,
         document_code=doc_code,
+        chapter_title=chapter_title,
+        clause_number=clause_number,
+        has_table=bool(has_table),
+        table_id=parsed_table_id,
+        table_number=table_number,
+        table_title=table_title,
+        lex_url=lex_url,
+        source_anchor=source_anchor,
+        source_excerpt=source_excerpt,
         source_ids=ids,
         source_payload=sources or [],
-        embedding=_safe_embed(question),
+        embedding=embedding,
         language=language,
         intent_type=intent_type,
+        origin_type=origin_type or "feedback",
+        generation_job_id=parsed_generation_job_id,
         source_hash=hash_value,
         verified_by_user=True,
         verified_count=1,
@@ -185,6 +278,20 @@ def upsert_verified_qa(
         verified_at=now,
     )
     db.add(row)
+    db.flush()
+    if row.embedding:
+        upsert_verified_qa_embedding(
+            str(row.id),
+            row.embedding,
+            shnq_code=row.document_code,
+            document_id=str(row.document_id) if row.document_id else None,
+            table_id=str(row.table_id) if row.table_id else None,
+            table_number=row.table_number,
+            has_table=row.has_table,
+            chapter_title=row.chapter_title,
+            clause_number=row.clause_number,
+            origin_type=row.origin_type,
+        )
     return row
 
 
@@ -268,11 +375,38 @@ def find_verified_answer_hit(
     q_vec = _safe_embed(question)
     if not q_vec:
         return None
+    qdrant_hits = search_verified_qa_ids(
+        q_vec,
+        limit=settings.VERIFIED_QA_SEMANTIC_CANDIDATES,
+        shnq_code=requested_doc_code if requested_doc_code else None,
+    )
+    if qdrant_hits:
+        ids = [item_id for item_id, _ in qdrant_hits]
+        rows = (
+            db.query(VerifiedQA)
+            .filter(VerifiedQA.is_active.is_(True), VerifiedQA.id.in_(ids))
+            .all()
+        )
+        row_by_id = {str(row.id): row for row in rows}
+        best_qdrant: VerifiedAnswerHit | None = None
+        for item_id, score in qdrant_hits:
+            row = row_by_id.get(item_id)
+            if not row:
+                continue
+            if requested_doc and _normalize_doc_code(row.document_code) != requested_doc:
+                continue
+            if score < settings.VERIFIED_QA_SEMANTIC_MIN_SCORE:
+                continue
+            if best_qdrant is None or score > best_qdrant.similarity:
+                best_qdrant = VerifiedAnswerHit(row=row, similarity=score, mode="semantic_qdrant")
+        if best_qdrant:
+            return best_qdrant
+
     rows = (
         db.query(VerifiedQA)
         .filter(VerifiedQA.is_active.is_(True), VerifiedQA.embedding.isnot(None))
         .order_by(VerifiedQA.verified_count.desc(), VerifiedQA.updated_at.desc())
-        .limit(500)
+        .limit(settings.VERIFIED_QA_SEMANTIC_LIMIT)
         .all()
     )
     best: VerifiedAnswerHit | None = None
@@ -281,10 +415,10 @@ def find_verified_answer_hit(
             continue
         candidate_vec = row.embedding if isinstance(row.embedding, list) else []
         sim = _cosine(q_vec, candidate_vec)
-        if sim < 0.9:
+        if sim < settings.VERIFIED_QA_SEMANTIC_MIN_SCORE:
             continue
         if best is None or sim > best.similarity:
-            best = VerifiedAnswerHit(row=row, similarity=sim, mode="semantic")
+            best = VerifiedAnswerHit(row=row, similarity=sim, mode="semantic_db")
     return best
 
 

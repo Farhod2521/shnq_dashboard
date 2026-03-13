@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.admin_qa_generator import router as admin_qa_generator_router
 from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.shnq import router as shnq_router
@@ -9,7 +10,7 @@ from app.api.upload import (
     router as upload_router,
 )
 from app.db.base import Base
-from app.db.schema_upgrade import ensure_section_category_schema
+from app.db.schema_upgrade import ensure_qa_generator_schema, ensure_section_category_schema
 from app.db.session import engine
 from app.models import *  # noqa: F401,F403
 
@@ -33,6 +34,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
     app.include_router(chat_router, prefix="/api/chat", tags=["Chat"])
     app.include_router(upload_router, prefix="/api/upload", tags=["Upload"])
+    app.include_router(admin_qa_generator_router, prefix="/api/admin/qa-generator", tags=["Admin QA Generator"])
 
     @app.on_event("startup")
     def _resume_stuck_document_pipelines():
@@ -49,4 +51,5 @@ def create_app() -> FastAPI:
 
 Base.metadata.create_all(bind=engine)
 ensure_section_category_schema(engine)
+ensure_qa_generator_schema(engine)
 app = create_app()

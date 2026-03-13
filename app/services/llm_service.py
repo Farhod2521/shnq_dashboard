@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -364,6 +365,49 @@ def generate_answer(
         model=model or settings.CHAT_MODEL,
         options={"temperature": 0.1, "max_tokens": 700},
     )
+
+
+def _parse_json_response(raw: str) -> dict | list:
+    value = (raw or "").strip()
+    if not value:
+        raise ValueError("LLM bo'sh JSON qaytardi.")
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:json)?\s*", "", value)
+        value = re.sub(r"\s*```$", "", value)
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        start = min([idx for idx in [value.find("{"), value.find("[")] if idx >= 0], default=-1)
+        end_obj = value.rfind("}")
+        end_arr = value.rfind("]")
+        end = max(end_obj, end_arr)
+        if start >= 0 and end > start:
+            return json.loads(value[start : end + 1])
+        raise
+
+
+def generate_json(
+    *,
+    prompt: str,
+    system: str | None = None,
+    schema: dict | None = None,
+    model: str | None = None,
+    options: dict | None = None,
+) -> dict | list:
+    schema_block = ""
+    if schema:
+        schema_block = (
+            "\n\nJSON schema:\n"
+            f"{json.dumps(schema, ensure_ascii=False)}\n\n"
+            "Faqat valid JSON qaytaring."
+        )
+    raw = generate_text(
+        prompt=f"{prompt}{schema_block}",
+        system=system,
+        model=model,
+        options=options,
+    )
+    return _parse_json_response(raw)
 
 
 def translate_text(
