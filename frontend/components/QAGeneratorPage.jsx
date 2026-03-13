@@ -18,6 +18,9 @@ function statusTone(status) {
   if (status === "rejected" || status === "failed") {
     return "border-rose-200 bg-rose-50 text-rose-700";
   }
+  if (status === "cancelled") {
+    return "border-slate-200 bg-slate-100 text-slate-600";
+  }
   if (status === "running") {
     return "border-amber-200 bg-amber-50 text-amber-700";
   }
@@ -285,6 +288,7 @@ export default function QAGeneratorPage({ apiBase }) {
   const [isGenerating, setIsGenerating] = useState(false);
   const [isLoadingJobs, setIsLoadingJobs] = useState(false);
   const [isBulkApproving, setIsBulkApproving] = useState(false);
+  const [jobActionId, setJobActionId] = useState("");
 
   const hasRunningJob = useMemo(
     () => jobs.some((job) => job.status === "queued" || job.status === "running"),
@@ -563,6 +567,71 @@ export default function QAGeneratorPage({ apiBase }) {
     }
   }
 
+  async function cancelJob(jobId) {
+    try {
+      setJobActionId(jobId);
+      const response = await fetch(`${apiBase}/api/admin/qa-generator/jobs/${jobId}/cancel`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        throw new Error(await parseResponse(response, "Generator jobni bekor qilishda xatolik"));
+      }
+      await loadJobs();
+      if (expandedJobId === jobId) {
+        await loadDrafts(jobId);
+      }
+      setNoticeType("success");
+      setNotice("Generator job bekor qilindi");
+    } catch (error) {
+      setNoticeType("error");
+      setNotice(error?.message || "Generator jobni bekor qilishda xatolik");
+    } finally {
+      setJobActionId("");
+    }
+  }
+
+  async function deleteJob(jobId) {
+    if (!window.confirm("Bu generator jobni va unga tegishli draftlarni o'chirasizmi?")) {
+      return;
+    }
+    try {
+      setJobActionId(jobId);
+      const response = await fetch(`${apiBase}/api/admin/qa-generator/jobs/${jobId}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        throw new Error(await parseResponse(response, "Generator jobni o'chirishda xatolik"));
+      }
+      if (expandedJobId === jobId) {
+        setExpandedJobId("");
+        setTablePreview(null);
+      }
+      setDraftsByJob((prev) => {
+        const next = { ...prev };
+        delete next[jobId];
+        return next;
+      });
+      setSelectedDraftIdsByJob((prev) => {
+        const next = { ...prev };
+        delete next[jobId];
+        return next;
+      });
+      setExpandedDraftIdsByJob((prev) => {
+        const next = { ...prev };
+        delete next[jobId];
+        return next;
+      });
+      await loadJobs();
+      setNoticeType("success");
+      setNotice("Generator job o'chirildi");
+    } catch (error) {
+      setNoticeType("error");
+      setNotice(error?.message || "Generator jobni o'chirishda xatolik");
+    } finally {
+      setJobActionId("");
+    }
+  }
+
   return (
     <div className="flex-1 overflow-y-auto bg-background-light p-8 dark:bg-background-dark">
       <div className="mx-auto max-w-[1400px] space-y-6">
@@ -660,6 +729,7 @@ export default function QAGeneratorPage({ apiBase }) {
                     <th className="px-5 py-4">Approved</th>
                     <th className="px-5 py-4">Status</th>
                     <th className="px-5 py-4">Yaratilgan</th>
+                    <th className="px-5 py-4">Amallar</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -692,10 +762,41 @@ export default function QAGeneratorPage({ apiBase }) {
                             </span>
                           </td>
                           <td className="px-5 py-4 text-xs font-medium text-slate-500 dark:text-slate-400">{formatDate(job.created_at)}</td>
+                          <td className="px-5 py-4">
+                            <div className="flex items-center gap-2">
+                              {job.status === "queued" || job.status === "running" ? (
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    cancelJob(job.id);
+                                  }}
+                                  disabled={jobActionId === job.id}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-black uppercase text-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  <span className="material-symbols-outlined text-[15px]">stop_circle</span>
+                                  {jobActionId === job.id ? "..." : "Bekor qilish"}
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    deleteJob(job.id);
+                                  }}
+                                  disabled={jobActionId === job.id}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] font-black uppercase text-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  <span className="material-symbols-outlined text-[15px]">delete</span>
+                                  {jobActionId === job.id ? "..." : "O'chirish"}
+                                </button>
+                              )}
+                            </div>
+                          </td>
                         </tr>
                         {isExpanded ? (
                           <tr className="border-t border-slate-200 bg-slate-50/70 dark:border-slate-800 dark:bg-slate-950/40">
-                            <td colSpan={8} className="px-5 py-5">
+                            <td colSpan={9} className="px-5 py-5">
                               <div className="space-y-4">
                                 <div className="flex flex-wrap items-center justify-between gap-3">
                                   <div>

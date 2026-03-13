@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str | None = None
     DEEPSEEK_API_KEY: str | None = None
     OPENAI_BASE_URL: str | None = None
+    OPENAI_TIMEOUT_SECONDS: int = 90
     HF_TOKEN: str | None = None
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_API_KEY: str | None = None
@@ -83,6 +84,7 @@ class Settings(BaseSettings):
     QA_GENERATOR_MAX_CONTEXT_ITEMS: int = 18
     QA_GENERATOR_MAX_CLAUSE_CHARS: int = 850
     QA_GENERATOR_MAX_TABLE_CHARS: int = 1400
+    QA_GENERATOR_STALE_MINUTES: int = 10
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -266,7 +266,10 @@ def _get_openai_client() -> OpenAI:
     api_key = settings.OPENAI_API_KEY or settings.DEEPSEEK_API_KEY
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY yoki DEEPSEEK_API_KEY kiritilmagan.")
-    kwargs = {"api_key": api_key}
+    kwargs = {
+        "api_key": api_key,
+        "timeout": settings.OPENAI_TIMEOUT_SECONDS,
+    }
     if settings.OPENAI_BASE_URL:
         kwargs["base_url"] = settings.OPENAI_BASE_URL.rstrip("/")
     return OpenAI(**kwargs)

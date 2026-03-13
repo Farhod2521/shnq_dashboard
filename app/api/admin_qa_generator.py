@@ -8,7 +8,9 @@ from app.db.dependency import get_db
 from app.models.qa_generation_job import QAGenerationJob
 from app.services.qa_generator_service import (
     approve_draft,
+    cancel_generation_job,
     create_generation_job,
+    delete_generation_job,
     get_document_generator_context,
     get_table_preview,
     list_drafts,
@@ -130,6 +132,29 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job topilmadi.")
     return {"job": serialize_job(job)}
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, db: Session = Depends(get_db)):
+    try:
+        job = cancel_generation_job(db, job_id)
+        db.commit()
+        db.refresh(job)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "job": serialize_job(job)}
+
+
+@router.delete("/jobs/{job_id}")
+def delete_job(job_id: str, db: Session = Depends(get_db)):
+    try:
+        delete_generation_job(db, job_id)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True}
 
 
 @router.get("/drafts")

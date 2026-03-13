@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
@@ -21,6 +21,7 @@ from app.services.llm_service import embed_text, generate_json
 
 
 PROMPT_VERSION = settings.QA_GENERATOR_PROMPT_VERSION
+ACTIVE_JOB_STATUSES = {"queued", "running"}
 QUESTION_DUPLICATE_RE = re.compile(r"\s+")
 TABLE_NUMBER_HINT_RE = re.compile(r"\b(\d+(?:\.\d+)*[a-z]?)\b", re.IGNORECASE)
 QUALITY_TERMS = {
@@ -89,6 +90,36 @@ GENERATOR_JSON_SCHEMA = {
 
 def _clean_text(value: str | None) -> str:
     return QUESTION_DUPLICATE_RE.sub(" ", (value or "").strip())
+
+
+def _is_active_job_status(status: str | None) -> bool:
+    return (status or "").strip().lower() in ACTIVE_JOB_STATUSES
+
+
+def cleanup_stale_jobs(db: Session) -> int:
+    threshold = datetime.utcnow() - timedelta(minutes=max(1, int(settings.QA_GENERATOR_STALE_MINUTES)))
+    stale_jobs = (
+        db.query(QAGenerationJob)
+        .filter(QAGenerationJob.status.in_(tuple(ACTIVE_JOB_STATUSES)))
+        .all()
+    )
+    changed = 0
+    for job in stale_jobs:
+        last_touch = job.updated_at or job.created_at
+        if not last_touch or last_touch >= threshold:
+            continue
+        job.status = "failed"
+        if not job.error_message:
+            job.error_message = (
+                "Generator job timeout bo'ldi yoki server restart sabab to'xtab qoldi. "
+                "Jobni o'chirib qayta ishga tushiring."
+            )
+        job.finished_at = datetime.utcnow()
+        job.updated_at = datetime.utcnow()
+        changed += 1
+    if changed:
+        db.commit()
+    return changed
 
 
 def _normalize_table_number(value: str | None) -> str:
@@ -178,6 +209,7 @@ def search_documents_for_generator(db: Session, query: str, limit: int = 15) -> 
 
 
 def get_document_generator_context(db: Session, document_id: str) -> dict[str, object]:
+    cleanup_stale_jobs(db)
     document_uuid = uuid.UUID(document_id)
     document = (
         db.query(Document)
@@ -547,6 +579,11 @@ def run_generation_job(job_id: str) -> None:
         job = db.query(QAGenerationJob).filter(QAGenerationJob.id == uuid.UUID(job_id)).first()
         if not job:
             return
+        if job.status == "cancelled":
+            job.finished_at = job.finished_at or datetime.utcnow()
+            job.updated_at = datetime.utcnow()
+            db.commit()
+            return
         document = db.query(Document).filter(Document.id == job.document_id).first()
         if not document:
             job.status = "failed"
@@ -583,6 +620,18 @@ def run_generation_job(job_id: str) -> None:
         attempts = 0
         max_attempts = max(4, math.ceil(remaining * 2.5))
         while remaining > 0 and attempts < max_attempts:
+            current_job = db.query(QAGenerationJob).filter(QAGenerationJob.id == job.id).first()
+            if not current_job:
+                return
+            if current_job.status == "cancelled":
+                current_job.finished_at = current_job.finished_at or datetime.utcnow()
+                current_job.updated_at = datetime.utcnow()
+                db.commit()
+                return
+            job = current_job
+            job.updated_at = datetime.utcnow()
+            db.commit()
+
             batch_count = min(settings.QA_GENERATOR_BATCH_SIZE, remaining)
             context_items = _pick_context_window(
                 clause_items,
@@ -611,6 +660,17 @@ def run_generation_job(job_id: str) -> None:
 
             if not generated:
                 continue
+
+            current_job = db.query(QAGenerationJob).filter(QAGenerationJob.id == job.id).first()
+            if not current_job:
+                return
+            if current_job.status == "cancelled":
+                current_job.finished_at = current_job.finished_at or datetime.utcnow()
+                current_job.updated_at = datetime.utcnow()
+                db.commit()
+                return
+            job = current_job
+
             created = _persist_drafts(db, job, generated)
             if created:
                 for item in generated[:created]:
@@ -628,6 +688,31 @@ def run_generation_job(job_id: str) -> None:
         db.commit()
     finally:
         db.close()
+
+
+def cancel_generation_job(db: Session, job_id: str) -> QAGenerationJob:
+    cleanup_stale_jobs(db)
+    job = db.query(QAGenerationJob).filter(QAGenerationJob.id == uuid.UUID(job_id)).first()
+    if not job:
+        raise ValueError("Job topilmadi.")
+    if not _is_active_job_status(job.status):
+        raise ValueError("Faqat queued yoki running jobni bekor qilish mumkin.")
+    job.status = "cancelled"
+    job.error_message = "Generator job admin tomonidan bekor qilindi."
+    job.finished_at = datetime.utcnow()
+    job.updated_at = datetime.utcnow()
+    return job
+
+
+def delete_generation_job(db: Session, job_id: str) -> None:
+    cleanup_stale_jobs(db)
+    job = db.query(QAGenerationJob).filter(QAGenerationJob.id == uuid.UUID(job_id)).first()
+    if not job:
+        raise ValueError("Job topilmadi.")
+    if _is_active_job_status(job.status):
+        raise ValueError("Running jobni o'chirishdan oldin uni bekor qiling.")
+    db.query(QAGeneratedDraft).filter(QAGeneratedDraft.job_id == job.id).delete(synchronize_session=False)
+    db.delete(job)
 
 
 def _build_draft_sources(db: Session, draft: QAGeneratedDraft) -> list[dict[str, object]]:
@@ -727,6 +812,7 @@ def list_jobs(
     document_id: str | None = None,
     limit: int = 50,
 ) -> list[QAGenerationJob]:
+    cleanup_stale_jobs(db)
     query = db.query(QAGenerationJob)
     if document_id:
         query = query.filter(QAGenerationJob.document_id == uuid.UUID(document_id))
