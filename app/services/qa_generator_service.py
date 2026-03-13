@@ -775,6 +775,8 @@ def approve_draft(db: Session, draft_id: str, review_note: str | None = None) ->
     draft = db.query(QAGeneratedDraft).filter(QAGeneratedDraft.id == uuid.UUID(draft_id)).first()
     if not draft:
         raise ValueError("Draft topilmadi.")
+    if draft.status == "approved":
+        raise ValueError("Draft allaqachon approved qilingan.")
     sources = _build_draft_sources(db, draft)
     row = upsert_verified_qa(
         db=db,
@@ -812,14 +814,31 @@ def approve_draft(db: Session, draft_id: str, review_note: str | None = None) ->
     return row
 
 
-def reject_draft(db: Session, draft_id: str, review_note: str | None = None) -> QAGeneratedDraft:
+def reject_draft(db: Session, draft_id: str, review_note: str | None = None) -> str:
     draft = db.query(QAGeneratedDraft).filter(QAGeneratedDraft.id == uuid.UUID(draft_id)).first()
     if not draft:
         raise ValueError("Draft topilmadi.")
-    draft.status = "rejected"
-    draft.review_note = review_note
-    draft.updated_at = datetime.utcnow()
-    return draft
+    if draft.status == "approved":
+        raise ValueError("Approved bo'lgan draftni reject qilib bo'lmaydi.")
+    job = db.query(QAGenerationJob).filter(QAGenerationJob.id == draft.job_id).first()
+    deleted_id = str(draft.id)
+    db.delete(draft)
+    db.flush()
+    if job:
+        job.generated_count = (
+            db.query(func.count(QAGeneratedDraft.id))
+            .filter(QAGeneratedDraft.job_id == job.id)
+            .scalar()
+            or 0
+        )
+        job.approved_count = (
+            db.query(func.count(QAGeneratedDraft.id))
+            .filter(QAGeneratedDraft.job_id == job.id, QAGeneratedDraft.status == "approved")
+            .scalar()
+            or 0
+        )
+        job.updated_at = datetime.utcnow()
+    return deleted_id
 
 
 def list_jobs(

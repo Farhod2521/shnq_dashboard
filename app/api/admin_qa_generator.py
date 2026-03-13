@@ -200,12 +200,12 @@ def bulk_approve_generated_drafts(payload: BulkApproveRequest, db: Session = Dep
 @router.post("/drafts/{draft_id}/reject")
 def reject_generated_draft(draft_id: str, payload: ReviewRequest, db: Session = Depends(get_db)):
     try:
-        reject_draft(db, draft_id, review_note=payload.review_note)
+        deleted_id = reject_draft(db, draft_id, review_note=payload.review_note)
         db.commit()
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True}
+    return {"ok": True, "deleted_draft_id": deleted_id}
 
 
 @router.get("/tables/{table_id}")

@@ -56,7 +56,11 @@ function isSamePayload(left, right) {
   }
 }
 
-function DraftDetails({ draft, onApprove, onReject, onPreviewTable }) {
+function DraftDetails({ draft, busyAction, onApprove, onReject, onPreviewTable }) {
+  const isApproving = busyAction === `approve:${draft.id}`;
+  const isRejecting = busyAction === `reject:${draft.id}`;
+  const isPreviewing = busyAction === `table:${draft.id}`;
+  const isBusy = Boolean(busyAction);
   return (
     <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-950/50">
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
@@ -83,25 +87,40 @@ function DraftDetails({ draft, onApprove, onReject, onPreviewTable }) {
             <div className="mt-3 flex flex-wrap gap-2">
               <button
                 type="button"
-                onClick={() => onApprove(draft.id)}
-                className="inline-flex items-center rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white"
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onApprove(draft.id);
+                }}
+                disabled={isBusy || draft.status === "approved"}
+                className="inline-flex items-center rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Approve
+                {isApproving ? "Approve..." : draft.status === "approved" ? "Approved" : "Approve"}
               </button>
               <button
                 type="button"
-                onClick={() => onReject(draft.id)}
-                className="inline-flex items-center rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700"
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onReject(draft.id);
+                }}
+                disabled={isBusy || draft.status === "approved"}
+                className="inline-flex items-center rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Reject
+                {isRejecting ? "Reject..." : "Reject"}
               </button>
               {draft.table_id ? (
                 <button
                   type="button"
-                  onClick={() => onPreviewTable(draft.table_id)}
-                  className="inline-flex items-center rounded-lg border border-primary/20 bg-primary/10 px-3 py-2 text-xs font-bold text-primary"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onPreviewTable(draft.id, draft.table_id);
+                  }}
+                  disabled={isBusy}
+                  className="inline-flex items-center rounded-lg border border-primary/20 bg-primary/10 px-3 py-2 text-xs font-bold text-primary disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  Jadvalni ko'rsatish
+                  {isPreviewing ? "Ochilmoqda..." : "Jadvalni ko'rsatish"}
                 </button>
               ) : null}
             </div>
@@ -297,6 +316,7 @@ export default function QAGeneratorPage({ apiBase }) {
   const [isLoadingJobs, setIsLoadingJobs] = useState(false);
   const [isBulkApproving, setIsBulkApproving] = useState(false);
   const [jobActionId, setJobActionId] = useState("");
+  const [draftActionId, setDraftActionId] = useState("");
 
   const stats = useMemo(() => {
     return {
@@ -490,6 +510,7 @@ export default function QAGeneratorPage({ apiBase }) {
 
   async function approveDraft(jobId, draftId) {
     try {
+      setDraftActionId(`approve:${draftId}`);
       const response = await fetch(`${apiBase}/api/admin/qa-generator/drafts/${draftId}/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -505,11 +526,14 @@ export default function QAGeneratorPage({ apiBase }) {
     } catch (error) {
       setNoticeType("error");
       setNotice(error?.message || "Draftni approve qilishda xatolik");
+    } finally {
+      setDraftActionId("");
     }
   }
 
   async function rejectDraft(jobId, draftId) {
     try {
+      setDraftActionId(`reject:${draftId}`);
       const response = await fetch(`${apiBase}/api/admin/qa-generator/drafts/${draftId}/reject`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -518,13 +542,23 @@ export default function QAGeneratorPage({ apiBase }) {
       if (!response.ok) {
         throw new Error(await parseResponse(response, "Draftni reject qilishda xatolik"));
       }
-      await loadDrafts(jobId);
+      await loadJobs();
+      setDraftsByJob((prev) => ({
+        ...prev,
+        [jobId]: (prev[jobId] || []).filter((item) => item.id !== draftId),
+      }));
       updateSelectedDraftIds(jobId, (items) => items.filter((item) => item !== draftId));
+      setExpandedDraftIdsByJob((prev) => ({
+        ...prev,
+        [jobId]: prev[jobId] === draftId ? "" : prev[jobId],
+      }));
       setNoticeType("success");
-      setNotice("Draft reject qilindi");
+      setNotice("Draft o'chirildi");
     } catch (error) {
       setNoticeType("error");
       setNotice(error?.message || "Draftni reject qilishda xatolik");
+    } finally {
+      setDraftActionId("");
     }
   }
 
@@ -553,8 +587,9 @@ export default function QAGeneratorPage({ apiBase }) {
     }
   }
 
-  async function openTablePreview(tableId) {
+  async function openTablePreview(draftId, tableId) {
     try {
+      setDraftActionId(`table:${draftId}`);
       const response = await fetch(`${apiBase}/api/admin/qa-generator/tables/${tableId}`, { cache: "no-store" });
       if (!response.ok) {
         throw new Error(await parseResponse(response, "Jadvalni olishda xatolik"));
@@ -563,6 +598,8 @@ export default function QAGeneratorPage({ apiBase }) {
     } catch (error) {
       setNoticeType("error");
       setNotice(error?.message || "Jadvalni olishda xatolik");
+    } finally {
+      setDraftActionId("");
     }
   }
 
@@ -919,6 +956,7 @@ export default function QAGeneratorPage({ apiBase }) {
                                                     <td colSpan={7} className="px-4 py-4">
                                                       <DraftDetails
                                                         draft={draft}
+                                                        busyAction={draftActionId}
                                                         onApprove={(draftId) => approveDraft(job.id, draftId)}
                                                         onReject={(draftId) => rejectDraft(job.id, draftId)}
                                                         onPreviewTable={openTablePreview}
