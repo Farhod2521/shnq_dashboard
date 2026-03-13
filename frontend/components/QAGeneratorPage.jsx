@@ -298,11 +298,6 @@ export default function QAGeneratorPage({ apiBase }) {
   const [isBulkApproving, setIsBulkApproving] = useState(false);
   const [jobActionId, setJobActionId] = useState("");
 
-  const hasRunningJob = useMemo(
-    () => jobs.some((job) => job.status === "queued" || job.status === "running"),
-    [jobs]
-  );
-
   const stats = useMemo(() => {
     return {
       totalJobs: jobs.length,
@@ -318,25 +313,9 @@ export default function QAGeneratorPage({ apiBase }) {
     return items;
   }, [jobs]);
 
-  const expandedJob = useMemo(
-    () => jobs.find((job) => job.id === expandedJobId) || null,
-    [expandedJobId, jobs]
-  );
-
   useEffect(() => {
     loadJobs();
   }, []);
-
-  useEffect(() => {
-    if (!hasRunningJob) return undefined;
-    const timer = window.setInterval(() => {
-      loadJobs().catch(() => {});
-      if (expandedJob?.id && (expandedJob.status === "queued" || expandedJob.status === "running")) {
-        loadDrafts(expandedJob.id).catch(() => {});
-      }
-    }, 8000);
-    return () => window.clearInterval(timer);
-  }, [expandedJob, hasRunningJob]);
 
   useEffect(() => {
     if (!query.trim() || !isDrawerOpen) {
@@ -587,6 +566,23 @@ export default function QAGeneratorPage({ apiBase }) {
     }
   }
 
+  async function handleManualRefresh() {
+    try {
+      await loadJobs();
+      if (expandedJobId) {
+        await loadDrafts(expandedJobId);
+      }
+      if (isDrawerOpen && selectedDocument?.id) {
+        await loadContext(selectedDocument.id);
+      }
+      setNoticeType("success");
+      setNotice("Sahifa yangilandi");
+    } catch (error) {
+      setNoticeType("error");
+      setNotice(error?.message || "Sahifani yangilashda xatolik");
+    }
+  }
+
   async function cancelJob(jobId) {
     try {
       setJobActionId(jobId);
@@ -671,6 +667,15 @@ export default function QAGeneratorPage({ apiBase }) {
               <div className="text-xs font-bold uppercase tracking-wide text-slate-400">Model</div>
               <div className="mt-1 text-lg font-black text-slate-900 dark:text-slate-50">gpt-5-mini</div>
             </div>
+            <button
+              type="button"
+              onClick={handleManualRefresh}
+              disabled={isLoadingJobs}
+              className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-5 py-3 text-sm font-bold text-slate-700 shadow-sm transition hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200"
+            >
+              <span className="material-symbols-outlined text-[18px]">refresh</span>
+              {isLoadingJobs ? "Yangilanmoqda..." : "Yangilash"}
+            </button>
             <button
               type="button"
               onClick={() => setIsDrawerOpen(true)}
