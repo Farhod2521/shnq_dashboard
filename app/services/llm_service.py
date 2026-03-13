@@ -382,6 +382,91 @@ def generate_answer(
     )
 
 
+def _extract_responses_text(response) -> str:
+    direct = (getattr(response, "output_text", None) or "").strip()
+    if direct:
+        return direct
+
+    parts: list[str] = []
+    for output_item in getattr(response, "output", []) or []:
+        content_items = getattr(output_item, "content", []) or []
+        for content in content_items:
+            content_type = getattr(content, "type", None)
+            if content_type == "output_text":
+                text_value = getattr(content, "text", None)
+                if text_value:
+                    parts.append(str(text_value))
+            elif content_type == "refusal":
+                refusal_value = getattr(content, "refusal", None)
+                if refusal_value:
+                    parts.append(str(refusal_value))
+    return "".join(parts).strip()
+
+
+def _generate_structured_json_text(
+    *,
+    prompt: str,
+    system: str | None,
+    schema: dict,
+    model: str | None,
+    options: dict | None,
+) -> str:
+    selected_model = model or settings.CHAT_MODEL
+    req = {
+        "model": selected_model,
+        "input": prompt,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "structured_response",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    }
+    if system:
+        req["instructions"] = system
+    if options:
+        if "max_output_tokens" in options and options["max_output_tokens"] is not None:
+            req["max_output_tokens"] = options["max_output_tokens"]
+        elif "max_tokens" in options and options["max_tokens"] is not None:
+            req["max_output_tokens"] = options["max_tokens"]
+        for key in ("temperature", "top_p"):
+            if key in options:
+                req[key] = options[key]
+
+    response = None
+    pending_req = dict(req)
+    while response is None:
+        try:
+            response = _get_openai_client().responses.create(**pending_req)
+        except Exception as exc:
+            error_text = (str(exc) or "").lower()
+            changed = False
+
+            if "unsupported" in error_text or "does not support" in error_text:
+                for key in ("temperature", "top_p"):
+                    if key not in pending_req:
+                        continue
+                    key_patterns = (f"'{key}'", f'"{key}"', key)
+                    if any(pattern in error_text for pattern in key_patterns):
+                        pending_req.pop(key, None)
+                        changed = True
+
+            if not changed:
+                raise
+
+    raw = _extract_responses_text(response)
+    if raw:
+        return raw
+
+    status = getattr(response, "status", None) or "unknown"
+    incomplete = getattr(response, "incomplete_details", None)
+    if incomplete:
+        raise ValueError(f"LLM bo'sh JSON qaytardi. status={status}; incomplete={incomplete}")
+    raise ValueError(f"LLM bo'sh JSON qaytardi. status={status}")
+
+
 def _parse_json_response(raw: str) -> dict | list:
     value = (raw or "").strip()
     if not value:
@@ -416,13 +501,32 @@ def generate_json(
             f"{json.dumps(schema, ensure_ascii=False)}\n\n"
             "Faqat valid JSON qaytaring."
         )
-    raw = generate_text(
-        prompt=f"{prompt}{schema_block}",
-        system=system,
-        model=model,
-        options=options,
-    )
-    return _parse_json_response(raw)
+    structured_error: Exception | None = None
+    if schema:
+        try:
+            raw = _generate_structured_json_text(
+                prompt=prompt,
+                system=system,
+                schema=schema,
+                model=model,
+                options=options,
+            )
+            return _parse_json_response(raw)
+        except Exception as exc:
+            structured_error = exc
+
+    try:
+        raw = generate_text(
+            prompt=f"{prompt}{schema_block}",
+            system=system,
+            model=model,
+            options=options,
+        )
+        return _parse_json_response(raw)
+    except Exception:
+        if structured_error:
+            raise structured_error
+        raise
 
 
 def translate_text(
