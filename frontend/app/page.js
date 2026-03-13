@@ -1408,6 +1408,10 @@ export default function HomePage() {
   const isUsersPage = pathname === "/users";
   const isQAPage = pathname === "/qa";
   const isQAGeneratorPage = pathname === "/qa-generator";
+  const shouldLoadDocumentsRoute = isDashboardPage || isDocumentsPage;
+  const shouldLoadTaxonomyRoute = isSectionsPage || isCategoriesPage || isDocumentsPage;
+  const shouldLoadUsersRoute = isUsersPage;
+  const shouldLoadQAHistoryRoute = isQAPage;
 
   useEffect(() => {
     const session = window.localStorage.getItem(AUTH_SESSION_KEY);
@@ -1925,18 +1929,46 @@ export default function HomePage() {
     if (!isAuthReady || !isAuthenticated) {
       return;
     }
-    loadDocuments();
-    loadTaxonomy();
-    loadUsers();
-    loadQAHistory();
+
+    const runRouteLoads = () => {
+      const tasks = [];
+      if (shouldLoadDocumentsRoute) {
+        tasks.push(loadDocuments());
+      }
+      if (shouldLoadTaxonomyRoute) {
+        tasks.push(loadTaxonomy());
+      }
+      if (shouldLoadUsersRoute) {
+        tasks.push(loadUsers());
+      }
+      if (shouldLoadQAHistoryRoute) {
+        tasks.push(loadQAHistory());
+      }
+      return Promise.all(tasks);
+    };
+
+    if (
+      !shouldLoadDocumentsRoute &&
+      !shouldLoadTaxonomyRoute &&
+      !shouldLoadUsersRoute &&
+      !shouldLoadQAHistoryRoute
+    ) {
+      return;
+    }
+
+    runRouteLoads().catch(() => {});
     const timer = window.setInterval(() => {
-      loadDocuments();
-      loadTaxonomy();
-      loadUsers();
-      loadQAHistory();
-    }, 3000);
+      runRouteLoads().catch(() => {});
+    }, 10000);
     return () => window.clearInterval(timer);
-  }, [isAuthReady, isAuthenticated]);
+  }, [
+    isAuthReady,
+    isAuthenticated,
+    shouldLoadDocumentsRoute,
+    shouldLoadTaxonomyRoute,
+    shouldLoadUsersRoute,
+    shouldLoadQAHistoryRoute,
+  ]);
 
   useEffect(() => {
     if (!cornerMessage) return;

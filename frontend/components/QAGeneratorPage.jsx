@@ -48,6 +48,14 @@ async function parseResponse(response, fallback) {
   }
 }
 
+function isSamePayload(left, right) {
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
+
 function DraftDetails({ draft, onApprove, onReject, onPreviewTable }) {
   return (
     <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-950/50">
@@ -310,6 +318,11 @@ export default function QAGeneratorPage({ apiBase }) {
     return items;
   }, [jobs]);
 
+  const expandedJob = useMemo(
+    () => jobs.find((job) => job.id === expandedJobId) || null,
+    [expandedJobId, jobs]
+  );
+
   useEffect(() => {
     loadJobs();
   }, []);
@@ -318,12 +331,12 @@ export default function QAGeneratorPage({ apiBase }) {
     if (!hasRunningJob) return undefined;
     const timer = window.setInterval(() => {
       loadJobs().catch(() => {});
-      if (expandedJobId) {
-        loadDrafts(expandedJobId).catch(() => {});
+      if (expandedJob?.id && (expandedJob.status === "queued" || expandedJob.status === "running")) {
+        loadDrafts(expandedJob.id).catch(() => {});
       }
-    }, 3000);
+    }, 8000);
     return () => window.clearInterval(timer);
-  }, [expandedJobId, hasRunningJob]);
+  }, [expandedJob, hasRunningJob]);
 
   useEffect(() => {
     if (!query.trim() || !isDrawerOpen) {
@@ -369,7 +382,8 @@ export default function QAGeneratorPage({ apiBase }) {
         throw new Error(await parseResponse(response, "Generator joblarini olishda xatolik"));
       }
       const data = await response.json();
-      setJobs(Array.isArray(data?.items) ? data.items : []);
+      const nextItems = Array.isArray(data?.items) ? data.items : [];
+      setJobs((prev) => (isSamePayload(prev, nextItems) ? prev : nextItems));
     } catch (error) {
       setNoticeType("error");
       setNotice(error?.message || "Generator joblarini olishda xatolik");
@@ -407,10 +421,16 @@ export default function QAGeneratorPage({ apiBase }) {
         throw new Error(await parseResponse(response, "Draftlarni olishda xatolik"));
       }
       const data = await response.json();
-      setDraftsByJob((prev) => ({
-        ...prev,
-        [jobId]: Array.isArray(data?.items) ? data.items : [],
-      }));
+      const nextItems = Array.isArray(data?.items) ? data.items : [];
+      setDraftsByJob((prev) => {
+        if (isSamePayload(prev[jobId] || [], nextItems)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [jobId]: nextItems,
+        };
+      });
     } finally {
       setLoadingDraftJobId("");
     }
