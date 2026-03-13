@@ -307,21 +307,36 @@ def generate_text(
             token_key = "max_completion_tokens" if _prefers_max_completion_tokens(selected_model) else "max_tokens"
             req[token_key] = options["max_tokens"]
 
-    try:
-        response = _get_openai_client().chat.completions.create(**req)
-    except Exception as exc:
-        # Some newer models reject max_tokens and require max_completion_tokens.
-        error_text = (str(exc) or "").lower()
-        needs_retry_with_completion_tokens = (
-            "max_tokens" in req
-            and "max_completion_tokens" not in req
-            and "max_completion_tokens" in error_text
-        )
-        if not needs_retry_with_completion_tokens:
-            raise
-        retry_req = dict(req)
-        retry_req["max_completion_tokens"] = retry_req.pop("max_tokens")
-        response = _get_openai_client().chat.completions.create(**retry_req)
+    response = None
+    pending_req = dict(req)
+    while response is None:
+        try:
+            response = _get_openai_client().chat.completions.create(**pending_req)
+        except Exception as exc:
+            # Some newer models reject max_tokens and require max_completion_tokens.
+            error_text = (str(exc) or "").lower()
+            changed = False
+
+            needs_retry_with_completion_tokens = (
+                "max_tokens" in pending_req
+                and "max_completion_tokens" not in pending_req
+                and "max_completion_tokens" in error_text
+            )
+            if needs_retry_with_completion_tokens:
+                pending_req["max_completion_tokens"] = pending_req.pop("max_tokens")
+                changed = True
+
+            if "unsupported" in error_text or "does not support" in error_text:
+                for key in ("temperature", "top_p"):
+                    if key not in pending_req:
+                        continue
+                    key_patterns = (f"'{key}'", f'"{key}"', key)
+                    if any(pattern in error_text for pattern in key_patterns):
+                        pending_req.pop(key, None)
+                        changed = True
+
+            if not changed:
+                raise
 
     if not response.choices:
         return ""
