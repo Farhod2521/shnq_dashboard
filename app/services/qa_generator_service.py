@@ -479,6 +479,7 @@ def _generate_batch(
     tables_by_number: dict[str, NormTable],
     clause_anchor_by_number: dict[str, str],
 ) -> list[dict[str, object]]:
+    output_limit = max(2800, min(5600, 1400 * max(1, batch_count)))
     prompt = _build_generation_prompt(
         document=document,
         batch_count=batch_count,
@@ -486,13 +487,28 @@ def _generate_batch(
         context_items=context_items,
         existing_questions=existing_questions,
     )
-    raw_payload = generate_json(
-        prompt=prompt,
-        system=_generator_system_prompt(),
-        schema=GENERATOR_JSON_SCHEMA,
-        model=settings.QA_GENERATOR_MODEL,
-        options={"temperature": 0.2, "top_p": 0.95, "max_tokens": 2400},
-    )
+    try:
+        raw_payload = generate_json(
+            prompt=prompt,
+            system=_generator_system_prompt(),
+            schema=GENERATOR_JSON_SCHEMA,
+            model=settings.QA_GENERATOR_MODEL,
+            options={"temperature": 0.2, "top_p": 0.95, "max_tokens": output_limit},
+        )
+    except Exception as exc:
+        error_text = (str(exc) or "").lower()
+        if "max_output_tokens" in error_text and batch_count > 1:
+            smaller_count = max(1, batch_count // 2)
+            return _generate_batch(
+                document=document,
+                batch_count=smaller_count,
+                include_table_questions=include_table_questions,
+                context_items=context_items[: max(4, smaller_count * 2)],
+                existing_questions=existing_questions,
+                tables_by_number=tables_by_number,
+                clause_anchor_by_number=clause_anchor_by_number,
+            )
+        raise
     if not isinstance(raw_payload, dict):
         return []
     items = raw_payload.get("items")
