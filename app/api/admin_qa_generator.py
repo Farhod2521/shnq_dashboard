@@ -11,11 +11,13 @@ from app.services.qa_generator_service import (
     cancel_generation_job,
     create_generation_job,
     delete_generation_job,
+    extend_generation_job,
     get_document_generator_context,
     get_table_preview,
     list_drafts,
     list_jobs,
     reject_draft,
+    restart_generation_job,
     run_generation_job,
     search_documents_for_generator,
     serialize_draft,
@@ -62,6 +64,10 @@ class ReviewRequest(BaseModel):
 class BulkApproveRequest(BaseModel):
     draft_ids: list[str]
     review_note: str | None = None
+
+
+class ExtendJobRequest(BaseModel):
+    additional_count: int = Field(ge=1, le=100)
 
 
 @router.get("/documents", response_model=list[DocumentSearchItem])
@@ -155,6 +161,37 @@ def delete_job(job_id: str, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True}
+
+
+@router.post("/jobs/{job_id}/restart")
+def restart_job(job_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    try:
+        job = restart_generation_job(db, job_id)
+        db.commit()
+        db.refresh(job)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    background_tasks.add_task(run_generation_job, str(job.id))
+    return {"ok": True, "job": serialize_job(job)}
+
+
+@router.post("/jobs/{job_id}/extend")
+def extend_job(
+    job_id: str,
+    payload: ExtendJobRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    try:
+        job = extend_generation_job(db, job_id, payload.additional_count)
+        db.commit()
+        db.refresh(job)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    background_tasks.add_task(run_generation_job, str(job.id))
+    return {"ok": True, "job": serialize_job(job)}
 
 
 @router.get("/drafts")

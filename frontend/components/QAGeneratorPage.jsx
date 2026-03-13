@@ -294,6 +294,66 @@ function GeneratorDrawer({
   );
 }
 
+function ExtendJobModal({ job, value, onChange, onClose, onSubmit, isSubmitting }) {
+  if (!job) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4">
+      <div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-slate-800 dark:bg-slate-950">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="text-[11px] font-black uppercase tracking-[0.22em] text-primary">Qo'shimcha savol</div>
+            <div className="mt-2 text-xl font-black text-slate-900 dark:text-slate-50">{job.document_code}</div>
+            <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">{job.document_title}</div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 text-slate-500 dark:border-slate-700"
+          >
+            <span className="material-symbols-outlined text-[20px]">close</span>
+          </button>
+        </div>
+
+        <div className="mt-6">
+          <label className="block text-sm font-semibold text-slate-700 dark:text-slate-300">
+            Nechta savol qo'shilsin
+            <input
+              type="number"
+              min="1"
+              max="100"
+              value={value}
+              onChange={(event) => onChange(event.target.value)}
+              className="mt-2 h-12 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-700 outline-none focus:border-primary dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            />
+          </label>
+          <div className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+            Tizim mavjud draft, approved va rejected savollarni tekshiradi. Takror savol qayta generatsiya qilinmaydi.
+          </div>
+        </div>
+
+        <div className="mt-6 flex items-center justify-end gap-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex items-center rounded-xl border border-slate-200 px-4 py-2 text-sm font-bold text-slate-600 dark:border-slate-700 dark:text-slate-300"
+          >
+            Bekor qilish
+          </button>
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={isSubmitting}
+            className="inline-flex items-center rounded-xl bg-primary px-4 py-2 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isSubmitting ? "Qo'shilmoqda..." : "Qo'shish"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function QAGeneratorPage({ apiBase }) {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -317,6 +377,8 @@ export default function QAGeneratorPage({ apiBase }) {
   const [isBulkApproving, setIsBulkApproving] = useState(false);
   const [jobActionId, setJobActionId] = useState("");
   const [draftActionId, setDraftActionId] = useState("");
+  const [extendModalJob, setExtendModalJob] = useState(null);
+  const [extendCount, setExtendCount] = useState("5");
 
   const stats = useMemo(() => {
     return {
@@ -620,9 +682,19 @@ export default function QAGeneratorPage({ apiBase }) {
     }
   }
 
+  function openExtendModal(job) {
+    setExtendModalJob(job);
+    setExtendCount("5");
+  }
+
+  function closeExtendModal() {
+    setExtendModalJob(null);
+    setExtendCount("5");
+  }
+
   async function cancelJob(jobId) {
     try {
-      setJobActionId(jobId);
+      setJobActionId(`cancel:${jobId}`);
       const response = await fetch(`${apiBase}/api/admin/qa-generator/jobs/${jobId}/cancel`, {
         method: "POST",
       });
@@ -648,7 +720,7 @@ export default function QAGeneratorPage({ apiBase }) {
       return;
     }
     try {
-      setJobActionId(jobId);
+      setJobActionId(`delete:${jobId}`);
       const response = await fetch(`${apiBase}/api/admin/qa-generator/jobs/${jobId}`, {
         method: "DELETE",
       });
@@ -680,6 +752,56 @@ export default function QAGeneratorPage({ apiBase }) {
     } catch (error) {
       setNoticeType("error");
       setNotice(error?.message || "Generator jobni o'chirishda xatolik");
+    } finally {
+      setJobActionId("");
+    }
+  }
+
+  async function restartJob(jobId) {
+    try {
+      setJobActionId(`restart:${jobId}`);
+      const response = await fetch(`${apiBase}/api/admin/qa-generator/jobs/${jobId}/restart`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        throw new Error(await parseResponse(response, "Generator jobni restart qilishda xatolik"));
+      }
+      await loadJobs();
+      if (expandedJobId === jobId) {
+        await loadDrafts(jobId);
+      }
+      setNoticeType("success");
+      setNotice("Generator job davom ettirishga qayta tushirildi");
+    } catch (error) {
+      setNoticeType("error");
+      setNotice(error?.message || "Generator jobni restart qilishda xatolik");
+    } finally {
+      setJobActionId("");
+    }
+  }
+
+  async function extendJob() {
+    if (!extendModalJob?.id) return;
+    try {
+      setJobActionId(`extend:${extendModalJob.id}`);
+      const response = await fetch(`${apiBase}/api/admin/qa-generator/jobs/${extendModalJob.id}/extend`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ additional_count: Number(extendCount || 0) }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseResponse(response, "Qo'shimcha savollarni qo'shishda xatolik"));
+      }
+      await loadJobs();
+      if (expandedJobId === extendModalJob.id) {
+        await loadDrafts(extendModalJob.id);
+      }
+      setNoticeType("success");
+      setNotice("Qo'shimcha savollar uchun generator qayta ishga tushdi");
+      closeExtendModal();
+    } catch (error) {
+      setNoticeType("error");
+      setNotice(error?.message || "Qo'shimcha savollarni qo'shishda xatolik");
     } finally {
       setJobActionId("");
     }
@@ -801,6 +923,9 @@ export default function QAGeneratorPage({ apiBase }) {
                     const selectedDraftIds = selectedDraftIdsByJob[job.id] || [];
                     const expandedDraftId = expandedDraftIdsByJob[job.id] || "";
                     const isDraftLoading = loadingDraftJobId === job.id;
+                    const canRestart = Boolean(job.can_restart);
+                    const canExtend = Boolean(job.can_extend);
+                    const isActive = job.status === "queued" || job.status === "running";
 
                     return (
                       <Fragment key={job.id}>
@@ -826,33 +951,60 @@ export default function QAGeneratorPage({ apiBase }) {
                           <td className="px-5 py-4 text-xs font-medium text-slate-500 dark:text-slate-400">{formatDate(job.created_at)}</td>
                           <td className="px-5 py-4">
                             <div className="flex items-center gap-2">
-                              {job.status === "queued" || job.status === "running" ? (
+                              {isActive ? (
                                 <button
                                   type="button"
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     cancelJob(job.id);
                                   }}
-                                  disabled={jobActionId === job.id}
+                                  disabled={jobActionId === `cancel:${job.id}`}
                                   className="inline-flex items-center gap-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-black uppercase text-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
                                 >
                                   <span className="material-symbols-outlined text-[15px]">stop_circle</span>
-                                  {jobActionId === job.id ? "..." : "Bekor qilish"}
+                                  {jobActionId === `cancel:${job.id}` ? "..." : "Bekor qilish"}
                                 </button>
-                              ) : (
+                              ) : null}
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  openExtendModal(job);
+                                }}
+                                disabled={!canExtend || Boolean(jobActionId)}
+                                className="inline-flex items-center gap-1 rounded-lg border border-primary/20 bg-primary/10 px-3 py-2 text-[11px] font-black uppercase text-primary disabled:cursor-not-allowed disabled:opacity-50"
+                                title="Qo'shimcha savol qo'shish"
+                              >
+                                <span className="material-symbols-outlined text-[15px]">add</span>
+                                +
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  restartJob(job.id);
+                                }}
+                                disabled={!canRestart || Boolean(jobActionId)}
+                                className="inline-flex items-center gap-1 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-[11px] font-black uppercase text-sky-700 disabled:cursor-not-allowed disabled:opacity-50"
+                                title={canRestart ? `Qolgan ${job.remaining_count} ta savolni davom ettirish` : "Davom ettiradigan savol qolmagan"}
+                              >
+                                <span className="material-symbols-outlined text-[15px]">restart_alt</span>
+                                {jobActionId === `restart:${job.id}` ? "..." : "Restart"}
+                              </button>
+                              {!isActive ? (
                                 <button
                                   type="button"
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     deleteJob(job.id);
                                   }}
-                                  disabled={jobActionId === job.id}
+                                  disabled={jobActionId === `delete:${job.id}` || Boolean(jobActionId && jobActionId !== `delete:${job.id}`)}
                                   className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] font-black uppercase text-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
                                 >
                                   <span className="material-symbols-outlined text-[15px]">delete</span>
-                                  {jobActionId === job.id ? "..." : "O'chirish"}
+                                  {jobActionId === `delete:${job.id}` ? "..." : "O'chirish"}
                                 </button>
-                              )}
+                              ) : null}
                             </div>
                           </td>
                         </tr>
@@ -1044,6 +1196,14 @@ export default function QAGeneratorPage({ apiBase }) {
         onSelectDocument={handleSelectDocument}
         onFormChange={(patch) => setForm((prev) => ({ ...prev, ...patch }))}
         onGenerate={handleGenerate}
+      />
+      <ExtendJobModal
+        job={extendModalJob}
+        value={extendCount}
+        onChange={setExtendCount}
+        onClose={closeExtendModal}
+        onSubmit={extendJob}
+        isSubmitting={jobActionId === `extend:${extendModalJob?.id || ""}`}
       />
     </div>
   );

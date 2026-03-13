@@ -97,6 +97,19 @@ def _is_active_job_status(status: str | None) -> bool:
     return (status or "").strip().lower() in ACTIVE_JOB_STATUSES
 
 
+def _remaining_for_job(job: QAGenerationJob) -> int:
+    requested = max(0, int(job.requested_count or 0))
+    generated = max(0, int(job.generated_count or 0))
+    return max(0, requested - generated)
+
+
+def _prepare_job_for_run(job: QAGenerationJob) -> None:
+    job.status = "queued"
+    job.error_message = None
+    job.finished_at = None
+    job.updated_at = datetime.utcnow()
+
+
 def cleanup_stale_jobs(db: Session) -> int:
     threshold = datetime.utcnow() - timedelta(minutes=max(1, int(settings.QA_GENERATOR_STALE_MINUTES)))
     stale_jobs = (
@@ -609,6 +622,14 @@ def run_generation_job(job_id: str) -> None:
             job.updated_at = datetime.utcnow()
             db.commit()
             return
+        remaining = _remaining_for_job(job)
+        if remaining <= 0:
+            job.status = "completed"
+            job.error_message = None
+            job.finished_at = datetime.utcnow()
+            job.updated_at = datetime.utcnow()
+            db.commit()
+            return
         document = db.query(Document).filter(Document.id == job.document_id).first()
         if not document:
             job.status = "failed"
@@ -640,7 +661,6 @@ def run_generation_job(job_id: str) -> None:
             if clause.clause_number
         }
 
-        remaining = max(1, int(job.requested_count or 1))
         offset = 0
         attempts = 0
         max_attempts = max(4, math.ceil(remaining * 2.5))
@@ -703,16 +723,54 @@ def run_generation_job(job_id: str) -> None:
                 remaining = max(0, remaining - created)
                 db.commit()
 
-        job.status = "completed" if int(job.generated_count or 0) > 0 else "failed"
-        if job.status == "completed":
+        total_remaining = _remaining_for_job(job)
+        if total_remaining <= 0:
+            job.status = "completed"
             job.error_message = None
-        elif not job.error_message:
-            job.error_message = "Generator hech qanday valid draft qaytara olmadi."
+        else:
+            job.status = "failed"
+            if not job.error_message:
+                generated_total = int(job.generated_count or 0)
+                requested_total = int(job.requested_count or 0)
+                if generated_total > 0:
+                    job.error_message = (
+                        f"Generator {requested_total} tadan {generated_total} ta unique draft yaratdi. "
+                        "Qolganini restart orqali davom ettiring yoki + bilan qo'shing."
+                    )
+                else:
+                    job.error_message = "Generator hech qanday valid draft qaytara olmadi."
         job.finished_at = datetime.utcnow()
         job.updated_at = datetime.utcnow()
         db.commit()
     finally:
         db.close()
+
+
+def restart_generation_job(db: Session, job_id: str) -> QAGenerationJob:
+    cleanup_stale_jobs(db)
+    job = db.query(QAGenerationJob).filter(QAGenerationJob.id == uuid.UUID(job_id)).first()
+    if not job:
+        raise ValueError("Job topilmadi.")
+    if _is_active_job_status(job.status):
+        raise ValueError("Running jobni restart qilishdan oldin bekor qiling.")
+    remaining = _remaining_for_job(job)
+    if remaining <= 0:
+        raise ValueError("Davom ettirish uchun qolgan savollar yo'q.")
+    _prepare_job_for_run(job)
+    return job
+
+
+def extend_generation_job(db: Session, job_id: str, additional_count: int) -> QAGenerationJob:
+    cleanup_stale_jobs(db)
+    job = db.query(QAGenerationJob).filter(QAGenerationJob.id == uuid.UUID(job_id)).first()
+    if not job:
+        raise ValueError("Job topilmadi.")
+    if _is_active_job_status(job.status):
+        raise ValueError("Running jobga qo'shimcha savol qo'shishdan oldin uni bekor qiling yoki tugashini kuting.")
+    count = max(1, int(additional_count or 0))
+    job.requested_count = int(job.requested_count or 0) + count
+    _prepare_job_for_run(job)
+    return job
 
 
 def cancel_generation_job(db: Session, job_id: str) -> QAGenerationJob:
@@ -912,6 +970,7 @@ def get_table_preview(db: Session, table_id: str) -> dict[str, object]:
 
 
 def _serialize_job(job: QAGenerationJob) -> dict[str, object]:
+    remaining_count = _remaining_for_job(job)
     return {
         "id": str(job.id),
         "document_id": str(job.document_id),
@@ -920,8 +979,11 @@ def _serialize_job(job: QAGenerationJob) -> dict[str, object]:
         "requested_count": int(job.requested_count or 0),
         "generated_count": int(job.generated_count or 0),
         "approved_count": int(job.approved_count or 0),
+        "remaining_count": remaining_count,
         "include_table_questions": bool(job.include_table_questions),
         "status": job.status,
+        "can_restart": (not _is_active_job_status(job.status)) and remaining_count > 0,
+        "can_extend": not _is_active_job_status(job.status),
         "generator_model": job.generator_model,
         "prompt_version": job.prompt_version,
         "created_by": job.created_by,
